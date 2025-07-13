@@ -1,6 +1,6 @@
 # GeminiLooper
 
-A Python-based application with Flask integration for managing Gemini API interactions and configurations.
+A Python-based application with Flask integration for managing Gemini API interactions and configurations, specifically designed to load balance multiple Gemini API keys for users who have several keys.
 
 ## Project Structure
 ```
@@ -51,6 +51,7 @@ chmod +x start_app.sh
 - Automatic virtual environment creation and activation
 - Automatic dependency installation
 - Cross-platform support (Windows, Linux, Mac)
+- Load balancing mechanism for multiple Gemini API keys
 
 ## Features
 - Gemini API integration

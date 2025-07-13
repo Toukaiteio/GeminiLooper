@@ -1,6 +1,6 @@
 # GeminiLooper
 
-一个基于Python的应用程序，集成了Flask，用于管理Gemini API交互和配置。
+一个基于Python的应用程序，集成了Flask，用于管理Gemini API交互和配置，专为拥有多个Gemini API密钥的用户设计，可实现多个API密钥的负载均衡使用。
 
 ## 项目结构
 ```
@@ -51,3 +51,4 @@ chmod +x start_app.sh
 - 自动创建和激活虚拟环境
 - 自动安装依赖
 - 跨平台支持（Windows、Linux、Mac）
+- 多个Gemini API密钥的负载均衡机制
