@@ -1,0 +1,12 @@
+{
+  "api_keys": [
+    "Your GEMINI API KEY HERE - 1",
+    "Your GEMINI API KEY HERE - 2",
+    "Your GEMINI API KEY HERE - 3",
+    "Your GEMINI API KEY HERE - 4",
+    "Your GEMINI API KEY HERE - 5",
+    "Your GEMINI API KEY HERE - 6"
+  ],
+  "usage_limit_per_key": 100,
+  "quota_reset_time": "00:05"
+}
