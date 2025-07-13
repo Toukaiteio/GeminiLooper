@@ -20,7 +20,7 @@ A Python-based application with Flask integration for managing Gemini API intera
 
 ### 1. Clone the Repository
 ```bash
-git clone <repository-url>
+git clone https://github.com/Toukaiteio/GeminiLooper.git
 cd GeminiLooper
 ```
 
