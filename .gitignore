@@ -1,3 +1,5 @@
 config.json
+key_usage.json
+unavailale.json
 .venv/
 __pycache__/

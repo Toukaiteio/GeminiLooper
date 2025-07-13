@@ -13,6 +13,9 @@ A Python-based application with Flask integration for managing Gemini API intera
 ├── key_manager.py        # Key management utilities
 ├── requirements.txt      # Project dependencies
 ├── start_app.bat         # Windows startup script
+├── start_app.sh          # Linux/Mac startup script
+└── templates/            # HTML templates
+    └── prompt_test.html  # Test prompt template
 └── start_app.sh          # Linux/Mac startup script
 ```
 

@@ -1,6 +1,6 @@
 import requests
 import json
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, render_template
 from apscheduler.schedulers.background import BackgroundScheduler
 from key_manager import KeyManager
 
@@ -23,11 +23,11 @@ def setup_scheduler():
 
     scheduler = BackgroundScheduler(daemon=True)
     scheduler.add_job(
-        key_manager.reset_all_keys, 
-        'cron', 
-        hour=hour, 
-        minute=minute,
-        timezone='Asia/Shanghai' # Or your local timezone
+        key_manager.reset_all_keys,
+        'cron',
+        hour=0,
+        minute=0,
+        timezone='America/Los_Angeles'
     )
     scheduler.start()
     print(f"Scheduler started. Keys will be reset daily at {hour:02d}:{minute:02d}.")
@@ -36,6 +36,63 @@ def setup_scheduler():
 @app.route('/status', methods=['GET'])
 def status():
     return jsonify(key_manager.get_key_status())
+
+@app.route('/status_test', methods=['GET'])
+def status_test():
+    from_param = request.args.get('from', type=str)
+    to_param = request.args.get('to', type=str)
+    
+    try:
+        # 尝试解析为数字索引
+        from_idx = int(from_param)
+        to_idx = int(to_param)
+        result = key_manager.get_key_status_range_by_index(from_idx, to_idx)
+    except ValueError:
+        # 作为字符串处理
+        result = key_manager.get_key_status_range_by_key(from_param, to_param)
+    
+    return jsonify(result)
+
+@app.route('/prompt_test', methods=['GET'])
+def prompt_test():
+    keys = key_manager.get_key_status()
+    return render_template('prompt_test.html', keys=keys['active_keys'])
+
+@app.route('/api/test_prompt', methods=['POST'])
+def api_test_prompt():
+    data = request.get_json()
+    api_key = data.get('api_key')
+    prompt = data.get('prompt')
+    model = data.get('model')
+
+    if not all([api_key, prompt, model]):
+        return jsonify({"error": "Missing required parameters"}), 400
+
+    def generate():
+        try:
+            url = f"{GOOGLE_API_BASE_URL}/v1beta/models/{model}:streamGenerateContent?key={api_key}"
+            payload = {
+                "contents": [{
+                    "parts": [{
+                        "text": prompt
+                    }]
+                }]
+            }
+            headers = {'Content-Type': 'application/json'}
+            
+            resp = requests.post(url, json=payload, headers=headers, stream=True)
+            
+            if resp.status_code != 200:
+                yield f"Error: {resp.status_code} {resp.text}"
+                return
+
+            for chunk in resp.iter_content(chunk_size=None):
+                yield chunk
+
+        except Exception as e:
+            yield f"Error: {str(e)}"
+
+    return Response(generate(), mimetype='text/event-stream')
 
 @app.route('/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
 def proxy(path):
@@ -77,6 +134,8 @@ def proxy(path):
         
         elif resp.status_code == 429:
             key_manager.increment_usage(api_key)
+        elif resp.status_code == 403:
+            key_manager.handle_403_error(api_key)
 
         # Stream the response back to the client
         def generate():

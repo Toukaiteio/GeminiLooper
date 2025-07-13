@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>API Key Prompt Test</title>
+    <style>
+        body { font-family: sans-serif; }
+        .container { max-width: 800px; margin: 0 auto; padding: 20px; }
+        .key-item { display: flex; align-items: center; margin-bottom: 10px; }
+        .key-text { flex-grow: 1; }
+        .key-text.hidden .full-key { display: none; }
+        .key-text .partial-key { display: inline; }
+        .key-text.hidden .partial-key { display: inline; }
+        .key-text:not(.hidden) .partial-key { display: none; }
+        .options { margin-bottom: 20px; }
+        .status { margin-left: 10px; padding: 5px; border-radius: 3px; }
+        .status.pending { background-color: #eee; }
+        .status.success { background-color: #d4edda; }
+        .status.error { background-color: #f8d7da; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>API Key Prompt Test</h1>
+        <div class="options">
+            <div>
+                <label><input type="checkbox" id="show-keys"> Show API Keys</label>
+            </div>
+            <div>
+                <label for="prompt">Prompt:</label>
+                <textarea id="prompt" rows="3" style="width: 100%;">你好，请用20个字左右介绍以下自己</textarea>
+            </div>
+            <div>
+                <label for="model">Model:</label>
+                <select id="model">
+                    <option value="gemini-2.5-flash">gemini-2.5-flash</option>
+                    <option value="gemini-2.5-pro">gemini-2.5-pro</option>
+                </select>
+            </div>
+            <button id="test-all">Test All</button>
+        </div>
+        <div id="key-list">
+            {% for key in keys %}
+            <div class="key-item" data-key="{{ key.key }}">
+                <div class="key-text hidden">
+                    <span class="partial-key">{{ key.key[:4] }}...{{ key.key[-4:] }}</span>
+                    <span class="full-key">{{ key.key }}</span>
+                </div>
+                <button class="test-single">Test</button>
+                <div class="status"></div>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const showKeysCheckbox = document.getElementById('show-keys');
+            const keyTextElements = document.querySelectorAll('.key-text');
+            const testAllButton = document.getElementById('test-all');
+            const testSingleButtons = document.querySelectorAll('.test-single');
+
+            showKeysCheckbox.addEventListener('change', () => {
+                keyTextElements.forEach(el => {
+                    el.classList.toggle('hidden', !showKeysCheckbox.checked);
+                });
+            });
+
+            testAllButton.addEventListener('click', () => {
+                document.querySelectorAll('.key-item').forEach(item => {
+                    const key = item.dataset.key;
+                    const statusEl = item.querySelector('.status');
+                    testApiKey(key, statusEl);
+                });
+            });
+
+            testSingleButtons.forEach(button => {
+                button.addEventListener('click', () => {
+                    const item = button.closest('.key-item');
+                    const key = item.dataset.key;
+                    const statusEl = item.querySelector('.status');
+                    testApiKey(key, statusEl);
+                });
+            });
+
+            async function testApiKey(apiKey, statusEl) {
+                const prompt = document.getElementById('prompt').value;
+                const model = document.getElementById('model').value;
+
+                statusEl.textContent = 'Testing...';
+                statusEl.className = 'status pending';
+
+                try {
+                    const response = await fetch('/api/test_prompt', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            api_key: apiKey,
+                            prompt: prompt,
+                            model: model
+                        })
+                    });
+
+                    statusEl.textContent = `Status: ${response.status}`;
+                    statusEl.className = `status ${response.ok ? 'success' : 'error'}`;
+                    
+                    const reader = response.body.getReader();
+                    const decoder = new TextDecoder();
+                    let result = '';
+
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        result += decoder.decode(value, { stream: true });
+                        statusEl.innerHTML += `<br>${result}`;
+                    }
+                } catch (error) {
+                    statusEl.textContent = `Error: ${error.message}`;
+                    statusEl.className = 'status error';
+                }
+            }
+        });
+    </script>
+</body>
+</html>

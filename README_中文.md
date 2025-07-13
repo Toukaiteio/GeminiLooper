@@ -13,6 +13,9 @@
 ├── key_manager.py        # 密钥管理工具
 ├── requirements.txt      # 项目依赖
 ├── start_app.bat         # Windows启动脚本
+├── start_app.sh          # Linux/Mac启动脚本
+└── templates/            # HTML模板
+    └── prompt_test.html  # 测试提示模板
 └── start_app.sh          # Linux/Mac启动脚本
 ```
 
