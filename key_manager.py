@@ -1,167 +1,279 @@
 import json
 import threading
-import hashlib
 import os
 from datetime import datetime, timedelta
 import pytz
-from collections import defaultdict
+import hashlib
 
 class KeyManager:
     def __init__(self, config_path='config.json', usage_file='key_usage.json', unavailable_file='unavailable.json'):
         self.config_path = config_path
         self.usage_file = usage_file
         self.unavailable_file = unavailable_file
-        
+        self.lock = threading.Lock()
+
+        # Load configuration
         with open(config_path) as f:
             config = json.load(f)
         
-        self.usage_limit = config.get('usage_limit_per_key', 100) # Default limit
-        self.lock = threading.Lock()
+        self.usage_limit = config.get('usage_limit_per_key', 100)
+        self.switch_threshold = config.get('switch_threshold', 40)
+        self.rotation_timeout = config.get('rotation_timeout', 30)
+        self.low_quota_threshold = config.get('low_quota_threshold', 40)
+        self.quota_reset_datetime_str = config.get('quota_reset_datetime', '2025-01-01 00:00') # New field
+        self.timezone = config.get('timezone', 'America/Los_Angeles')
 
-        # 从文件中加载潜在不可用和已不可用的密钥
+        # Load unavailable keys
         self.potential_unavailable = self._load_potential_unavailable()
         self.unavailable_keys = self._load_unavailable_keys()
 
-        # 从配置中加载所有密钥，并排除已永久不可用的密钥
-        available_keys = [k for k in config['api_keys'] if k not in self.unavailable_keys]
+        # Load all keys from config and filter out unavailable ones
+        priority_keys = [k for k in config.get('priority_keys', []) if k not in self.unavailable_keys]
+        secondary_keys = [k for k in config.get('secondary_keys', []) if k not in self.unavailable_keys]
         
-        # 加载使用数据
-        self.keys = self._load_usage_data(available_keys)
+        # Load usage data and initialize key pools
+        self.all_keys_usage, self.next_reset_timestamp = self._load_usage_data(priority_keys + secondary_keys)
+        # 确保 next_reset_timestamp 在初始化时总是指向未来的重置点
+        self._update_next_reset_timestamp()
+        
+        self.priority_pool = [k for k in self.all_keys_usage if k['key'] in priority_keys]
+        self.secondary_pool = [k for k in self.all_keys_usage if k['key'] in secondary_keys]
+
+        # State variables for sticky key logic
+        self.current_key_info = None
+        self.rotation_timer = None
 
     def get_key(self):
         with self.lock:
-            # 筛选出活跃且不在潜在不可用列表中的key
-            active_keys = [k for k in self.keys if k['active'] and k['key'] not in self.potential_unavailable]
-            if not active_keys:
-                # 如果没有完全活跃的key，则尝试使用潜在不可用的key
-                potential_keys = [k for k in self.keys if k['active'] and k['key'] in self.potential_unavailable]
-                if not potential_keys:
-                    return None
-                # 返回潜在不可用key中使用次数最少的
-                return min(potential_keys, key=lambda k: k['usage'])
+            # If there's an active key, reset the rotation timer and return it
+            if self.current_key_info:
+                self._reset_rotation_timer()
+                print(f"DEBUG: Sticking with key {self.current_key_info['key'][:4]}****")
+                return self.current_key_info
 
-            # 返回活跃key中使用次数最少的
-            return min(active_keys, key=lambda k: k['usage'])
+            # If no active key, select a new one
+            new_key_info = self._select_new_key()
+            if not new_key_info:
+                print("ERROR: No available keys to select.")
+                return None
+            
+            self.current_key_info = new_key_info
+            print(f"DEBUG: Selected new key {self.current_key_info['key'][:4]}****")
+            return self.current_key_info
 
     def increment_usage(self, key_str):
         with self.lock:
-            for key_info in self.keys:
-                if key_info['key'] == key_str:
-                    key_info['usage'] += 1
-                    if key_info['usage'] >= self.usage_limit:
-                        key_info['active'] = False
-                    
-                    # 如果密钥在潜在不可用列表中，成功调用后将其移除（重置错误计数）
-                    if key_str in self.potential_unavailable:
-                        del self.potential_unavailable[key_str]
-                        self._save_unavailable_data()
-                    
-                    self._save_usage_data() # 保存使用情况
-                    break
+            if self.current_key_info and self.current_key_info['key'] == key_str:
+                self.current_key_info['usage'] += 1
+                print(f"DEBUG: Key {key_str[:4]}**** usage is now {self.current_key_info['usage']}")
+                self._save_usage_data()
+
+                # If usage reaches the switch threshold, start the rotation timer
+                if self.current_key_info['usage'] >= self.switch_threshold:
+                    self._start_rotation_timer()
+            
+            # Handle successful usage for potentially unavailable keys
+            if key_str in self.potential_unavailable:
+                del self.potential_unavailable[key_str]
+                self._save_unavailable_data()
+
+    def _select_new_key(self):
+        # Filter for active keys (usage < limit)
+        active_priority = [k for k in self.priority_pool if k['usage'] < self.usage_limit]
+        active_secondary = [k for k in self.secondary_pool if k['usage'] < self.usage_limit]
+
+        # Check if any priority key has enough quota
+        priority_with_high_quota = [k for k in active_priority if (self.usage_limit - k['usage']) > self.low_quota_threshold]
+
+        # If there are priority keys with high quota, use the one with the least usage
+        if priority_with_high_quota:
+            print("DEBUG: Selecting from priority keys with high quota.")
+            return min(priority_with_high_quota, key=lambda k: k['usage'])
+        
+        # Otherwise, use any available key (priority or secondary), picking the one with least usage
+        all_active_keys = active_priority + active_secondary
+        if all_active_keys:
+            print("DEBUG: No high-quota priority keys. Selecting from all available keys.")
+            return min(all_active_keys, key=lambda k: k['usage'])
+
+        return None
+
+    def _start_rotation_timer(self):
+        self._cancel_rotation_timer() # Cancel any existing timer
+        self.rotation_timer = threading.Timer(self.rotation_timeout, self._rotate_key)
+        self.rotation_timer.start()
+        print(f"DEBUG: Switch threshold reached for key {self.current_key_info['key'][:4]}****. Starting {self.rotation_timeout}s rotation timer.")
+
+    def _reset_rotation_timer(self):
+        if self.current_key_info and self.current_key_info['usage'] >= self.switch_threshold:
+            self._start_rotation_timer()
+
+    def _cancel_rotation_timer(self):
+        if self.rotation_timer:
+            self.rotation_timer.cancel()
+            self.rotation_timer = None
+
+    def _rotate_key(self):
+        with self.lock:
+            print(f"DEBUG: Rotation timer expired. Releasing key {self.current_key_info['key'][:4]}****.")
+            self.current_key_info = None
+            self._cancel_rotation_timer()
+
+    def handle_403_error(self, key_str):
+        with self.lock:
+            masked_key = f"{key_str[:4]}****{key_str[-6:]}"
+            print(f"ERROR: 403 Error reported for key: {masked_key}")
+
+            current_errors = self.potential_unavailable.get(key_str, 0) + 1
+            
+            if current_errors >= 3:
+                print(f"INFO: Key {masked_key} reached 3 errors and will be permanently disabled.")
+                if key_str in self.potential_unavailable:
+                    del self.potential_unavailable[key_str]
+                
+                if key_str not in self.unavailable_keys:
+                    self.unavailable_keys.append(key_str)
+                
+                self._remove_key_from_pools(key_str)
+                self._remove_key_from_config(key_str)
+            else:
+                print(f"INFO: Key {masked_key} now has {current_errors} error(s).")
+                self.potential_unavailable[key_str] = current_errors
+            
+            self._save_unavailable_data()
+            
+            # If the error was on the current key, force rotation
+            if self.current_key_info and self.current_key_info['key'] == key_str:
+                self.current_key_info = None
+                self._cancel_rotation_timer()
+
+    def _remove_key_from_pools(self, key_str):
+        self.priority_pool = [k for k in self.priority_pool if k['key'] != key_str]
+        self.secondary_pool = [k for k in self.secondary_pool if k['key'] != key_str]
+        self.all_keys_usage = [k for k in self.all_keys_usage if k['key'] != key_str]
+
+    # --- Data Loading and Saving (largely unchanged but adapted) ---
+
+    def _load_usage_data(self, current_api_keys):
+        # 初始化默认值
+        stored_usage = {}
+        next_reset = None
+        
+        if os.path.exists(self.usage_file):
+            with open(self.usage_file, 'r') as f:
+                try:
+                    data = json.load(f)
+                    # 新格式包含使用情况和下次重置时间
+                    stored_usage = data.get('usage_data', {})
+                    next_reset_str = data.get('next_reset')
+                    next_reset = datetime.fromisoformat(next_reset_str) if next_reset_str else None
+                except json.JSONDecodeError:
+                    pass
+
+        # 处理旧格式迁移 (如果需要，这里可以添加旧格式的判断和迁移逻辑)
+        # 目前假设 usage_data 总是字典，如果不是，则需要更复杂的迁移逻辑
+        if isinstance(stored_usage, list):
+            print("DEBUG: Migrating old usage format to new structure")
+            stored_usage = {item['key']: item['usage'] for item in stored_usage if 'key' in item}
+            # 迁移后保存，确保下次加载是新格式
+            self._save_usage_data_internal({
+                'usage_data': stored_usage,
+                'next_reset': next_reset.isoformat() if next_reset else None
+            })
+
+        # 创建新的使用数据，合并当前API密钥
+        usage_data = []
+        for key in current_api_keys:
+            usage_data.append({
+                "key": key,
+                "usage": stored_usage.get(key, 0)
+            })
+            
+        return usage_data, next_reset
+
+    def _save_usage_data(self):
+        data_to_save = {item['key']: item['usage'] for item in self.all_keys_usage}
+        self._save_usage_data_internal(data_to_save)
+
+    def _save_usage_data_internal(self, data_to_save):
+        # 构建包含下次重置时间的完整数据结构
+        full_data = {
+            'usage_data': data_to_save,
+            'next_reset': self.next_reset_timestamp.isoformat() if self.next_reset_timestamp else None
+        }
+        
+        temp_file = self.usage_file + '.tmp'
+        with open(temp_file, 'w') as f:
+            json.dump(full_data, f, indent=4)
+        os.replace(temp_file, self.usage_file)
 
     def reset_all_keys(self):
         with self.lock:
             print("Resetting all API key usage counts.")
-            for key_info in self.keys:
+            for key_info in self.all_keys_usage:
                 key_info['usage'] = 0
-                key_info['active'] = True
             self._save_usage_data()
+            # Also reset the current key to force re-selection
+            self.current_key_info = None
+            self._cancel_rotation_timer()
+            # 重置后立即更新下次重置时间
+            self._update_next_reset_timestamp()
 
     def get_key_status(self):
         with self.lock:
-            # 将潜在不可用key的错误信息附加到key状态中
-            keys_with_status = []
-            for k in self.keys:
-                key_copy = k.copy()
-                if k['key'] in self.potential_unavailable:
-                    key_copy['403_errors'] = self.potential_unavailable[k['key']]
-                keys_with_status.append(key_copy)
-
             return {
-                'active_keys': keys_with_status,
+                'current_key': self.current_key_info,
+                'priority_pool_status': self.priority_pool,
+                'secondary_pool_status': self.secondary_pool,
                 'potential_unavailable': self.potential_unavailable,
-                'unavailable_keys': self.unavailable_keys
+                'unavailable_keys': self.unavailable_keys,
+                'next_reset': self.next_reset_timestamp.isoformat() if self.next_reset_timestamp else None
             }
 
-    def handle_403_error(self, key_str):
+    def _update_next_reset_timestamp(self):
         with self.lock:
-            # 打印屏蔽后的key
-            masked_key = f"{key_str[:4]}****{key_str[-6:]}"
-            print(f"403 Error reported for key: {masked_key}")
-
-            # 获取当前错误次数，如果不存在则为0，然后加1
-            current_errors = self.potential_unavailable.get(key_str, 0) + 1
+            tz = pytz.timezone(self.timezone)
+            now = datetime.now(tz)
             
-            if current_errors >= 3:
-                print(f"Key {masked_key} has reached 3 errors and will be permanently disabled.")
-                # 从潜在不可用列表中移除
-                if key_str in self.potential_unavailable:
-                    del self.potential_unavailable[key_str]
-                
-                # 添加到永久不可用列表
-                if key_str not in self.unavailable_keys:
-                    self.unavailable_keys.append(key_str)
-                
-                # 从主密钥列表中移除
-                self.keys = [k for k in self.keys if k['key'] != key_str]
-                
-                # 从配置文件中移除
-                self._remove_key_from_config(key_str)
-                
-            else:
-                # 更新潜在不可用列表中的错误次数
-                print(f"Key {masked_key} now has {current_errors} error(s).")
-                self.potential_unavailable[key_str] = current_errors
-            
-            # 立即保存状态
-            self._save_unavailable_data()
-
-    def _hash_key(self, key_str):
-        return hashlib.sha256(key_str.encode()).hexdigest()
-
-    def _load_usage_data(self, current_api_keys):
-        if not os.path.exists(self.usage_file):
-            print(f"'{self.usage_file}' not found. Creating a new one.")
-            new_keys = [{"key": key, "usage": 0, "active": True} for key in current_api_keys]
-            self._save_usage_data_internal(new_keys) # 首次创建时直接保存
-            return new_keys
-
-        with open(self.usage_file, 'r') as f:
+            # 解析配置中的完整日期时间字符串
             try:
-                stored_data = json.load(f)
-            except json.JSONDecodeError:
-                stored_data = []
+                initial_reset_dt = tz.localize(datetime.strptime(self.quota_reset_datetime_str, '%Y-%m-%d %H:%M'))
+            except ValueError:
+                print(f"WARNING: Invalid quota_reset_datetime format in config. Using current time for initial reset. Format should be YYYY-MM-DD HH:MM. Config value: {self.quota_reset_datetime_str}")
+                initial_reset_dt = now.replace(hour=0, minute=0, second=0, microsecond=0) # Default to start of today
 
-        hash_to_key = {self._hash_key(key): key for key in current_api_keys}
-        synced_keys = []
-        
-        # 使用集合来跟踪已处理的哈希，以提高效率
-        processed_hashes = set()
+            # 如果当前时间已经过了初始重置时间，则计算下一个重置点
+            # 每次重置都是在 initial_reset_dt 的时间点，但日期会根据当前日期调整
+            if now >= initial_reset_dt:
+                # 如果当前时间已经过了配置的日期时间，则将日期推迟到明天或下一个重置周期
+                # 确保重置时间点是未来的
+                while initial_reset_dt <= now:
+                    initial_reset_dt += timedelta(days=1)
+                self.next_reset_timestamp = initial_reset_dt
+            else:
+                self.next_reset_timestamp = initial_reset_dt
+            
+            print(f"DEBUG: Updated next reset timestamp to {self.next_reset_timestamp.strftime('%Y-%m-%d %H:%M:%S%z')}")
+            self._save_usage_data() # 保存更新后的下次重置时间
 
-        ast = pytz.timezone('America/Los_Angeles') # 太平洋时间
-        now_utc = datetime.now(pytz.utc)
-
-        for item in stored_data:
-            key_hash = item.get('key_hash')
-            if key_hash in hash_to_key:
-                key = hash_to_key[key_hash]
-                next_update = datetime.fromisoformat(item['next_update']).astimezone(pytz.utc)
-                
-                usage = 0 if now_utc >= next_update else item['usage']
-                
-                synced_keys.append({
-                    "key": key,
-                    "usage": usage,
-                    "active": usage < self.usage_limit
-                })
-                processed_hashes.add(key_hash)
-
-        # 添加在配置文件中但不在使用文件中的新密钥
-        for key in current_api_keys:
-            if self._hash_key(key) not in processed_hashes:
-                synced_keys.append({"key": key, "usage": 0, "active": True})
-        
-        return synced_keys
+    def check_and_reset_if_missed(self):
+        with self.lock:
+            tz = pytz.timezone(self.timezone)
+            now = datetime.now(tz)
+            print(f"DEBUG: Current time in {self.timezone}: {now.strftime('%Y-%m-%d %H:%M:%S%z')}")
+            
+            # 确保 next_reset_timestamp 已经被初始化
+            if not self.next_reset_timestamp:
+                self._update_next_reset_timestamp()
+            
+            # 如果当前时间已经超过了预定的下次重置时间
+            if now >= self.next_reset_timestamp:
+                print(f"INFO: Performing scheduled reset at {self.next_reset_timestamp.strftime('%Y-%m-%d %H:%M:%S%z')}")
+                self.reset_all_keys()
+                # 重置后，立即计算并更新下一次的重置时间
+                self._update_next_reset_timestamp()
+            else:
+                print(f"INFO: Next reset scheduled at {self.next_reset_timestamp.strftime('%Y-%m-%d %H:%M:%S%z')} (current time: {now.strftime('%Y-%m-%d %H:%M:%S%z')})")
 
     def _load_potential_unavailable(self):
         if not os.path.exists(self.unavailable_file):
@@ -169,8 +281,7 @@ class KeyManager:
         with open(self.unavailable_file, 'r') as f:
             try:
                 data = json.load(f)
-                # 将列表转换为字典以便快速查找
-                return {item['key']: item['errors'] for item in data.get('potential_unavailable', [])}
+                return data.get('potential_unavailable', {})
             except (json.JSONDecodeError, KeyError):
                 return {}
 
@@ -186,7 +297,7 @@ class KeyManager:
 
     def _save_unavailable_data(self):
         data = {
-            'potential_unavailable': [{'key': k, 'errors': v} for k, v in self.potential_unavailable.items()],
+            'potential_unavailable': self.potential_unavailable,
             'unavailable': self.unavailable_keys
         }
         temp_file = self.unavailable_file + '.tmp'
@@ -197,35 +308,8 @@ class KeyManager:
     def _remove_key_from_config(self, key_str):
         with open(self.config_path, 'r+') as f:
             config = json.load(f)
-            if key_str in config.get('api_keys', []):
-                config['api_keys'].remove(key_str)
-                f.seek(0)
-                f.truncate()
-                json.dump(config, f, indent=2)
-
-    def _save_usage_data(self):
-        """公共保存接口，确保 self.keys 是最新的"""
-        self._save_usage_data_internal(self.keys)
-
-    def _save_usage_data_internal(self, keys_to_save):
-        """内部保存方法，用于将密钥使用数据写入文件"""
-        ast = pytz.timezone('America/Los_Angeles') # 太平洋时间
-        now_ast = datetime.now(ast)
-        
-        # 计算下次更新时间（太平洋时间明天0点）
-        next_update_ast = (now_ast + timedelta(days=1)).replace(
-            hour=0, minute=0, second=0, microsecond=0)
-        
-        data_to_save = []
-        for key_info in keys_to_save:
-            data_to_save.append({
-                "key_hash": self._hash_key(key_info['key']),
-                "usage": key_info['usage'],
-                "last_saved": datetime.now(pytz.utc).isoformat(),
-                "next_update": next_update_ast.isoformat()
-            })
-
-        temp_file = self.usage_file + '.tmp'
-        with open(temp_file, 'w') as f:
-            json.dump(data_to_save, f, indent=4)
-        os.replace(temp_file, self.usage_file)
+            config['priority_keys'] = [k for k in config.get('priority_keys', []) if k != key_str]
+            config['secondary_keys'] = [k for k in config.get('secondary_keys', []) if k != key_str]
+            f.seek(0)
+            f.truncate()
+            json.dump(config, f, indent=2)

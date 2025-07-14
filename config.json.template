@@ -1,12 +1,14 @@
 {
-  "api_keys": [
-    "Your GEMINI API KEY HERE - 1",
-    "Your GEMINI API KEY HERE - 2",
-    "Your GEMINI API KEY HERE - 3",
-    "Your GEMINI API KEY HERE - 4",
-    "Your GEMINI API KEY HERE - 5",
-    "Your GEMINI API KEY HERE - 6"
+  "priority_keys": [
+    "put_your_high_priority_api_key_here_1",
+    "put_your_high_priority_api_key_here_2"
+  ],
+  "secondary_keys": [
+    "put_your_low_priority_api_key_here_1"
   ],
   "usage_limit_per_key": 100,
+  "switch_threshold": 40,
+  "rotation_timeout": 30,
+  "low_quota_threshold": 40,
   "quota_reset_time": "00:05"
 }
