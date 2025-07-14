@@ -138,7 +138,7 @@ class KeyManager:
         # 使用集合来跟踪已处理的哈希，以提高效率
         processed_hashes = set()
 
-        ast = pytz.timezone('America/Halifax') # 大西洋标准时间
+        ast = pytz.timezone('America/Los_Angeles') # 太平洋时间
         now_utc = datetime.now(pytz.utc)
 
         for item in stored_data:
@@ -209,10 +209,10 @@ class KeyManager:
 
     def _save_usage_data_internal(self, keys_to_save):
         """内部保存方法，用于将密钥使用数据写入文件"""
-        ast = pytz.timezone('America/Halifax') # 大西洋标准时间
+        ast = pytz.timezone('America/Los_Angeles') # 太平洋时间
         now_ast = datetime.now(ast)
         
-        # 计算下次更新时间（大西洋时间明天0点）
+        # 计算下次更新时间（太平洋时间明天0点）
         next_update_ast = (now_ast + timedelta(days=1)).replace(
             hour=0, minute=0, second=0, microsecond=0)
         
