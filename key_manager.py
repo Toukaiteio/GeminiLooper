@@ -2,8 +2,8 @@ import json
 import threading
 import os
 from datetime import datetime, timedelta
+import time
 import pytz
-import hashlib
 
 class KeyManager:
     def __init__(self, config_path='config.json', usage_file='key_usage.json', unavailable_file='unavailable.json'):
@@ -11,134 +11,811 @@ class KeyManager:
         self.usage_file = usage_file
         self.unavailable_file = unavailable_file
         self.lock = threading.RLock()
-        self.need_rotation = False  # Flag for deferred key rotation
 
         # Load configuration
         with open(config_path) as f:
-            config = json.load(f)
+            self.config = json.load(f)
         
-        self.usage_limit = config.get('usage_limit_per_key', 100)
-        self.switch_threshold = config.get('switch_threshold', 40)
-        self.rotation_timeout = config.get('rotation_timeout', 30)
-        self.low_quota_threshold = config.get('low_quota_threshold', 40)
-        self.quota_reset_datetime_str = config.get('quota_reset_datetime', '2025-01-01 00:00') # New field
-        self.timezone = config.get('timezone', 'America/Los_Angeles')
-        self.default_model = config.get('default_model', 'gemini-pro') # New field for default model
+        self.models_config = self.config.get('models', {})
+        self.fallback_strategy = self.config.get('fallback_strategy', {})
+        self.model_order = ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-1.5-flash"]
+        
+        self.quota_reset_datetime_str = self.config.get('quota_reset_datetime', '2025-01-01 00:00')
+        self.timezone = self.config.get('timezone', 'America/Los_Angeles')
+        self.usage_record_retention_seconds = self.config.get('usage_record_retention_seconds', 86400)
 
         # Load unavailable keys
         self.potential_unavailable = self._load_potential_unavailable()
         self.unavailable_keys = self._load_unavailable_keys()
 
         # Load all keys from config and filter out unavailable ones
-        priority_keys = [k for k in config.get('priority_keys', []) if k not in self.unavailable_keys]
-        secondary_keys = [k for k in config.get('secondary_keys', []) if k not in self.unavailable_keys]
-        
-        # Load usage data and initialize key pools
-        self.all_keys_usage, self.next_reset_timestamp = self._load_usage_data(priority_keys + secondary_keys)
-        # 确保 next_reset_timestamp 在初始化时总是指向未来的重置点
+        self.priority_keys = [k for k in self.config.get('priority_keys', []) if k not in self.unavailable_keys]
+        self.secondary_keys = [k for k in self.config.get('secondary_keys', []) if k not in self.unavailable_keys]
+        self.all_keys = self.priority_keys + self.secondary_keys
+
+        # Load usage data
+        self.usage_data, self.next_reset_timestamp, self.rate_limited_keys, self.model_specific_disabled = self._load_usage_data()
         self._update_next_reset_timestamp()
         
-        self.priority_pool = [k for k in self.all_keys_usage if k['key'] in priority_keys]
-        self.secondary_pool = [k for k in self.all_keys_usage if k['key'] in secondary_keys]
+        # If usage data is empty (e.g., first run or corrupted file), initialize it.
+        if not self.usage_data:
+            print("INFO: Initializing new usage data structure.")
+            self.usage_data = {}
+            for key in self.all_keys:
+                self.usage_data[key] = {}
+                for model in self.model_order:
+                    self.usage_data[key][model] = {
+                        "usage_records": [],
+                        "total_tokens": 0,
+                        "daily_tokens": 0,
+                        "is_temporarily_disabled": False,
+                        "disabled_until": 0,
+                        "last_429_error": 0,
+                        "consecutive_429_count": 0
+                    }
+            self._save_usage_data()
 
-        # State variables for sticky key logic
-        self.current_key_info = None
-        self.rotation_timer = None
+        # State variables
+        self.current_key_index = 0
+        self.last_pro_usage_time = None
 
-    def get_key(self):
-        with self.lock:
-            # Check if rotation is needed
-            if self.need_rotation:
-                print("DEBUG: Rotation flag detected. Performing deferred rotation.")
-                self._rotate_key()
-                self.need_rotation = False
-                if not self.current_key_info:
-                    return None
+        # Perform a global cleanup of old usage records on startup.
+        self._prune_all_usage_records()
 
-            # If there's an active key, reset the rotation timer and return it
-            if self.current_key_info:
-                self._reset_rotation_timer()
-                print(f"DEBUG: Sticking with key {self.current_key_info['key'][:4]}**** with model {self.current_key_info.get('model', self.default_model)}")
-                return self.current_key_info
 
-            # If no active key, select a new one
-            new_key_info = self._select_new_key()
-            if not new_key_info:
-                print("ERROR: No available keys to select.")
-                return None
-            
-            self.current_key_info = new_key_info
-            print(f"DEBUG: Selected new key {self.current_key_info['key'][:4]}**** with model {self.current_key_info.get('model', self.default_model)}")
-            return self.current_key_info
-
-    def increment_usage(self, key_str):
-        with self.lock:
-            if self.current_key_info and self.current_key_info['key'] == key_str:
-                self.current_key_info['usage'] += 1
-                print(f"DEBUG: Key {key_str[:4]}**** usage is now {self.current_key_info['usage']}")
-                self._save_usage_data()
-
-                # If usage reaches the switch threshold, start the rotation timer
-                if self.current_key_info['usage'] >= self.switch_threshold:
-                    self._start_rotation_timer()
-            
-            # Handle successful usage for potentially unavailable keys
-            if key_str in self.potential_unavailable:
-                del self.potential_unavailable[key_str]
-                self._save_unavailable_data()
-
-    def _select_new_key(self):
-        # Filter for active keys (usage < limit)
-        active_priority = [k for k in self.priority_pool if k['usage'] < self.usage_limit]
-        active_secondary = [k for k in self.secondary_pool if k['usage'] < self.usage_limit]
-
-        # Check if any priority key has enough quota
-        priority_with_high_quota = [k for k in active_priority if (self.usage_limit - k['usage']) > self.low_quota_threshold]
-
-        # If there are priority keys with high quota, use the one with the least usage
-        if priority_with_high_quota:
-            print("DEBUG: Selecting from priority keys with high quota.")
-            selected_key = min(priority_with_high_quota, key=lambda k: k['usage'])
-            selected_key['model'] = self.default_model # Assign default model
-            return selected_key
+    def _prune_all_usage_records(self):
+        """
+        Iterates through all keys and models in the usage data and prunes old
+        usage records based on the configured retention period.
+        """
+        now = time.time()
+        retention_seconds = self.usage_record_retention_seconds
+        data_changed = False
         
-        # Otherwise, use any available key (priority or secondary), picking the one with least usage
-        all_active_keys = active_priority + active_secondary
-        if all_active_keys:
-            print("DEBUG: No high-quota priority keys. Selecting from all available keys.")
-            selected_key = min(all_active_keys, key=lambda k: k['usage'])
-            selected_key['model'] = self.default_model # Assign default model
-            return selected_key
+        # Ensure usage_data is a dictionary before iterating
+        if not isinstance(self.usage_data, dict):
+            return
+
+        for key, models_data in self.usage_data.items():
+            # Ensure models_data is a dictionary
+            if not isinstance(models_data, dict):
+                continue
+            for model, model_data in models_data.items():
+                if isinstance(model_data, dict) and "usage_records" in model_data:
+                    original_count = len(model_data["usage_records"])
+                    
+                    # Filter records, ensuring 'timestamp' exists and is a number
+                    model_data["usage_records"] = [
+                        r for r in model_data["usage_records"]
+                        if isinstance(r, dict) and isinstance(r.get("timestamp"), (int, float)) and now - r["timestamp"] < retention_seconds
+                    ]
+                    
+                    if len(model_data["usage_records"]) != original_count:
+                        data_changed = True
+        
+        if data_changed:
+            print(f"INFO: Pruned old usage records globally based on a {retention_seconds}s retention period.")
+            self._save_usage_data()
+
+    def get_model_and_key(self, requested_model=None):
+        """
+        Intelligent model selection engine - selects the optimal model and key combination
+        based on the requested model and current state.
+        """
+        with self.lock:
+            self._check_and_recover_models()
+
+            if requested_model is None:
+                requested_model = self.config.get('default_model', 'gemini-2.5-pro')
+            
+            if requested_model not in self.model_order:
+                print(f"WARN: Requested model '{requested_model}' not found. Defaulting to 'gemini-2.5-pro'.")
+                requested_model = 'gemini-2.5-pro'
+
+            # --- Primary Selection Logic ---
+            models_to_check = self._get_model_fallback_order(requested_model)
+            
+            for model in models_to_check:
+                result = self._find_available_key_for_model(model)
+                if result:
+                    selected_model, selected_key = result
+                    self._update_selection_state(selected_model, selected_key)
+                    print(f"DEBUG: Selected model '{selected_model}' with key '{selected_key[:4]}****'.")
+                    return selected_model, selected_key
+
+            # --- Borrowing Logic ---
+            # This block is triggered only if the primary selection logic fails for all models and keys.
+            active_key = self.all_keys[self.current_key_index] if self.all_keys else None
+            if active_key and self._is_last_model_cooling_down(active_key):
+                print(f"INFO: Primary key '{active_key[:4]}****' is in cooldown. Attempting to borrow from other keys.")
+                borrowed_model, borrowed_key = self._find_borrowed_model()
+                if borrowed_model and borrowed_key:
+                    # IMPORTANT: Do not update the main state (current_key_index).
+                    # This is a temporary borrow.
+                    print(f"DEBUG: Successfully borrowed model '{borrowed_model}' from key '{borrowed_key[:4]}****'.")
+                    return borrowed_model, borrowed_key
+
+            print("ERROR: All models and keys are currently unavailable, including borrowing options.")
+            return None, None
+
+    def _try_recover_requested_model(self, requested_model):
+        """Attempts to recover the user-requested model."""
+        if requested_model == "gemini-2.5-pro" and self.last_pro_usage_time:
+            if time.time() - self.last_pro_usage_time > 5:
+                recovery_threshold = self.models_config.get("gemini-2.5-pro", {}).get("recovery_threshold", 0)
+                for key in self.all_keys:
+                    if (self._is_key_model_available(key, "gemini-2.5-pro") and
+                        self._get_tokens_in_last_minute(key, "gemini-2.5-pro") < recovery_threshold):
+                        self.last_pro_usage_time = None  # Reset timer
+                        return True
+        return False
+
+    def _get_model_fallback_order(self, requested_model):
+        """Gets the fallback order for a model."""
+        fallback_order = self.fallback_strategy.get(requested_model, [])
+        
+        if not fallback_order:
+            if requested_model == "gemini-2.5-pro":
+                fallback_order = [m for m in self.model_order if m != requested_model]
+            else:
+                non_pro_models = [m for m in self.model_order if m != "gemini-2.5-pro" and m != requested_model]
+                fallback_order = non_pro_models + ["gemini-2.5-pro"]
+        
+        if requested_model not in fallback_order:
+            fallback_order.insert(0, requested_model)
+        elif fallback_order[0] != requested_model:
+            fallback_order.remove(requested_model)
+            fallback_order.insert(0, requested_model)
+        
+        return fallback_order
+
+    def _find_available_key_for_model(self, model):
+        """Finds an available key for a given model, implementing a 'sticky' strategy."""
+        if not self.all_keys:
+            return None
+
+        current_key = self.all_keys[self.current_key_index]
+        if self._is_key_model_available(current_key, model):
+            return model, current_key
+
+        num_keys = len(self.all_keys)
+        for i in range(1, num_keys):
+            next_key_index = (self.current_key_index + i) % num_keys
+            next_key = self.all_keys[next_key_index]
+            
+            if self._is_key_model_available(next_key, model):
+                return model, next_key
 
         return None
 
-    def _start_rotation_timer(self):
-        self._cancel_rotation_timer() # Cancel any existing timer
-        # 动态计算退避时间
-        retry_count = getattr(self.current_key_info, 'retry_count', 0) + 1
-        print(f"DEBUG: Switch threshold reached for key {self.current_key_info['key'][:4]}****. Starting {self.rotation_timeout}s rotation timer.")
+    def _is_last_model_cooling_down(self, key):
+        """
+        Checks if the key's single last available model is in a cooldown state.
+        """
+        # A key is in this state if it has NO available models right now,
+        # but it has exactly one model that is in temporary cooldown.
 
-    def _reset_rotation_timer(self):
-        if self.current_key_info and self.current_key_info['usage'] >= self.switch_threshold:
-            self._start_rotation_timer()
+        currently_available_models = [m for m in self.model_order if self._is_key_model_available(key, m)]
+        if len(currently_available_models) > 0:
+            return False # If any model is usable right now, we don't need to borrow.
 
-    def _cancel_rotation_timer(self):
-        if self.rotation_timer:
-            self.rotation_timer.cancel()
-            self.rotation_timer = None
+        # Get all models for this key that are temporarily disabled.
+        temporarily_disabled_models = []
+        if key in self.usage_data:
+            for model in self.model_order:
+                if self._is_model_temporarily_disabled(key, model):
+                     temporarily_disabled_models.append(model)
+        
+        # The condition is met if there are no available models and exactly one is cooling down.
+        if len(temporarily_disabled_models) == 1:
+            print(f"DEBUG: Key {key[:4]}**** is in last model cooldown for model {temporarily_disabled_models[0]}.")
+            return True
+            
+        return False
 
-    def _rotate_key(self):
-        if self.current_key_info:
-            print(f"DEBUG: Rotation timer expired. Releasing key {self.current_key_info['key'][:4]}****.")
-            self.current_key_info = None
-            self._cancel_rotation_timer()
-            # 强制立即获取新密钥
-            new_key = self._select_new_key()
-            if new_key:
-                self.current_key_info = new_key
-                print(f"DEBUG: Auto-rotated to new key {self.current_key_info['key'][:4]}****")
-                self._start_rotation_timer()
+    def _find_borrowed_model(self):
+        """
+        Finds an available model from a borrowable (rate-limited) key.
+        """
+        borrowable_keys = [k for k in self.rate_limited_keys if k in self.all_keys]
+        if not borrowable_keys:
+            return None, None
 
+        # Fallback order, excluding the pro model which is assumed to be exhausted on these keys
+        models_to_check = [m for m in self.model_order if m != "gemini-2.5-pro"]
+
+        for key in borrowable_keys:
+            for model in models_to_check:
+                if self._is_key_model_available(key, model):
+                    print(f"DEBUG: Found borrowable model '{model}' on key '{key[:4]}****'.")
+                    return model, key
+        
+        return None, None
+
+    def _update_selection_state(self, model, key):
+        """更新选择状态"""
+        # 更新当前密钥索引
+        if key in self.all_keys:
+            self.current_key_index = self.all_keys.index(key)
+        
+        # 如果选择了gemini-2.5-pro，记录使用时间
+        if model == "gemini-2.5-pro":
+            self.last_pro_usage_time = time.time()
+
+    def record_token_usage(self, key, model, tokens):
+        with self.lock:
+            if key not in self.usage_data:
+                self.usage_data[key] = {}
+            if model not in self.usage_data[key]:
+                self.usage_data[key][model] = {
+                    "usage_records": [],
+                    "total_tokens": 0,
+                    "daily_tokens": 0,
+                    "is_temporarily_disabled": False,
+                    "disabled_until": 0,
+                    "last_429_error": 0,
+                    "consecutive_429_count": 0
+                }
+            
+            # Append new usage record
+            self.usage_data[key][model]["usage_records"].append({
+                "timestamp": time.time(),
+                "tokens": tokens
+            })
+            
+            # Update persistent total tokens
+            self.usage_data[key][model]["total_tokens"] += tokens
+            self.usage_data[key][model]["daily_tokens"] = self.usage_data[key][model].get("daily_tokens", 0) + tokens
+            
+            # Prune old records
+            self._prune_usage_records(key, model)
+            self._save_usage_data()
+
+    def record_successful_request(self, key, model):
+        """Resets the consecutive error count after a successful request."""
+        with self.lock:
+            if key in self.usage_data and model in self.usage_data[key]:
+                if self.usage_data[key][model].get("consecutive_429_count", 0) > 0:
+                    print(f"INFO: Resetting consecutive 429 count for model '{model}' on key '{key[:4]}****' after successful request.")
+                    self.usage_data[key][model]["consecutive_429_count"] = 0
+                    self._save_usage_data()
+
+    def handle_429_error(self, key, model):
+        """
+        智能处理429错误，根据当前使用量和模型类型决定处理策略
+        """
+        with self.lock:
+            current_usage = self._get_tokens_in_last_minute(key, model)
+            model_config = self.models_config.get(model, {})
+            recovery_threshold = model_config.get("recovery_threshold", 0)
+            max_consecutive_429 = 2  # Per user request, force switch after 2 errors.
+            
+            print(f"INFO: 429 Error received for key {key[:4]}**** on model {model}. Current usage: {current_usage}")
+            
+            # 确保模型数据存在
+            if key not in self.usage_data:
+                self.usage_data[key] = {}
+            if model not in self.usage_data[key]:
+                self.usage_data[key][model] = {
+                    "usage_records": [],
+                    "total_tokens": 0,
+                    "daily_tokens": 0,
+                    "is_temporarily_disabled": False,
+                    "disabled_until": 0,
+                    "last_429_error": 0,
+                    "consecutive_429_count": 0
+                }
+            
+            model_data = self.usage_data[key][model]
+            model_data["last_429_error"] = time.time()
+            model_data["consecutive_429_count"] = model_data.get("consecutive_429_count", 0) + 1
+            
+            # 判断处理策略
+            if current_usage < recovery_threshold:
+                # 使用量低于恢复阈值但仍然429，可能是API问题
+                print(f"WARN: 429 error with low usage ({current_usage} < {recovery_threshold}). Consecutive errors: {model_data['consecutive_429_count']}")
+                
+                if model_data["consecutive_429_count"] >= max_consecutive_429:
+                    if model == "gemini-2.5-pro":
+                        # For gemini-2.5-pro, mark the whole key as rate-limited (borrowable)
+                        print(f"WARN: Key {key[:4]}**** has {model_data['consecutive_429_count']} consecutive 429 errors on gemini-2.5-pro. Adding to rate-limited list.")
+                        if key not in self.rate_limited_keys:
+                            self.rate_limited_keys.append(key)
+                    else:
+                        # For other models, just disable the model on this key
+                        print(f"WARN: Temporarily disabling model {model} on key {key[:4]}**** due to {model_data['consecutive_429_count']} consecutive 429 errors with low usage.")
+                        self._disable_model_temporarily(key, model)
+            else:
+                # 正常的速率限制，临时禁用该模型
+                print(f"INFO: Normal rate limiting detected. Temporarily disabling model {model} on key {key[:4]}****.")
+                self._disable_model_temporarily(key, model)
+            
+            # 如果是gemini-2.5-pro出错，设置恢复检查计时器
+            if model == "gemini-2.5-pro":
+                self.last_pro_usage_time = time.time()
+            
+            self._save_usage_data()
+
+    def _handle_429_with_context(self, key, model, current_usage):
+        """
+        根据当前使用情况和模型类型智能处理429错误
+        返回处理策略：'switch_model', 'disable_key', 'disable_key_model'
+        """
+        model_config = self.models_config.get(model, {})
+        recovery_threshold = model_config.get("recovery_threshold", 0)
+        max_consecutive_429 = model_config.get("max_consecutive_429", 3)
+        
+        if key not in self.usage_data or model not in self.usage_data[key]:
+            return 'switch_model'
+        
+        model_data = self.usage_data[key][model]
+        consecutive_count = model_data.get("consecutive_429_count", 0)
+        
+        if current_usage < recovery_threshold:
+            # 低使用量但仍然429错误
+            if consecutive_count >= max_consecutive_429:
+                if model == "gemini-2.5-pro":
+                    return 'disable_key'  # 禁用整个密钥
+                else:
+                    return 'disable_key_model'  # 只禁用该模型
+            else:
+                return 'switch_model'  # 切换模型
+        else:
+            # 正常的速率限制
+            return 'disable_key_model'  # 临时禁用该模型
+
+    def _get_tokens_in_last_minute(self, key, model):
+        # 添加防御性类型检查
+        if not isinstance(key, str):
+            print(f"CRITICAL ERROR: Invalid key type {type(key)} in usage check: {key}")
+            return float('inf')  # 返回极大值强制切换密钥
+        
+        if key not in self.usage_data or model not in self.usage_data[key]:
+            return 0
+        
+        now = time.time()
+        total_tokens = 0
+        # Ensure we are accessing the list of records correctly
+        records = self.usage_data[key][model].get("usage_records", [])
+        for record in records:
+            if now - record["timestamp"] <= 60:
+                total_tokens += record["tokens"]
+        return total_tokens
+
+    def _prune_usage_records(self, key, model):
+        if key not in self.usage_data or model not in self.usage_data[key]:
+            return
+
+        now = time.time()
+        # Keep records from the last 5 minutes to be safe
+        records = self.usage_data[key][model].get("usage_records", [])
+        self.usage_data[key][model]["usage_records"] = [
+            r for r in records if now - r.get("timestamp", 0) < self.usage_record_retention_seconds
+        ]
+
+    def _load_usage_data(self):
+        if not os.path.exists(self.usage_file):
+            print(f"INFO: Usage file '{self.usage_file}' not found. Initializing with empty data.")
+            return {}, None, [], {}
+        
+        data = {}
+        try:
+            with open(self.usage_file, 'r') as f:
+                data = json.load(f)
+            
+            # Validate the structure of the loaded data
+            if not isinstance(data, dict) or 'usage_data' not in data or 'next_reset' not in data:
+                raise ValueError("Invalid format in usage file.")
+            
+            usage = data.get('usage_data', {})
+            rate_limited_keys = data.get('rate_limited_keys', [])
+            model_specific_disabled = data.get('model_specific_disabled', {})
+            # Ensure usage is a dictionary
+            if not isinstance(usage, dict):
+                raise ValueError("Invalid 'usage_data' type in usage file.")
+
+            # Data migration: Check and convert old format to new format
+            for key, models_data in usage.items():
+                for model, model_data in models_data.items():
+                    if isinstance(model_data, list):
+                        print(f"INFO: Migrating old usage data format for key '{key}' and model '{model}'.")
+                        total_tokens_migrated = sum(r['tokens'] for r in model_data)
+                        usage[key][model] = {
+                            "usage_records": model_data,
+                            "total_tokens": total_tokens_migrated,
+                            "daily_tokens": 0,
+                            "is_temporarily_disabled": False,
+                            "disabled_until": 0,
+                            "last_429_error": 0,
+                            "consecutive_429_count": 0
+                        }
+                    elif isinstance(model_data, dict) and "is_temporarily_disabled" not in model_data:
+                        # Migrate existing dict format to include new fields
+                        print(f"INFO: Adding new fields to existing data for key '{key}' and model '{model}'.")
+                        usage[key][model].update({
+                            "daily_tokens": model_data.get("daily_tokens", 0),
+                            "is_temporarily_disabled": False,
+                            "disabled_until": 0,
+                            "last_429_error": 0,
+                            "consecutive_429_count": 0
+                        })
+
+            next_reset_str = data.get('next_reset')
+
+            next_reset = datetime.fromisoformat(next_reset_str) if next_reset_str else None
+            
+            # Basic validation for next_reset
+            if next_reset_str and not isinstance(next_reset, datetime):
+                raise ValueError("Invalid 'next_reset' format in usage file.")
+
+            print(f"INFO: Successfully loaded usage data from '{self.usage_file}'.")
+            return usage, next_reset, rate_limited_keys, model_specific_disabled
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            timestamp = int(time.time())
+            illegal_filename = f"__illegal_{timestamp}_{self.usage_file}"
+            print(f"ERROR: Failed to load usage data from '{self.usage_file}' due to format mismatch or corruption: {e}")
+            print(f"INFO: Renaming '{self.usage_file}' to '{illegal_filename}' and initializing with empty data.")
+            # Ensure the file is closed before attempting to rename
+            if os.path.exists(self.usage_file):
+                try:
+                    os.rename(self.usage_file, illegal_filename)
+                except PermissionError:
+                    print(f"WARNING: Could not rename '{self.usage_file}' to '{illegal_filename}'. It might be in use by another process. Please manually delete or rename it.")
+            return {}, None, [], {}
+
+    def _save_usage_data(self):
+        full_data = {
+            'usage_data': self.usage_data,
+            'next_reset': self.next_reset_timestamp.isoformat() if self.next_reset_timestamp else None,
+            'rate_limited_keys': self.rate_limited_keys,
+            'model_specific_disabled': self.model_specific_disabled
+        }
+        temp_file = self.usage_file + '.tmp'
+        with open(temp_file, 'w') as f:
+            json.dump(full_data, f, indent=4)
+        os.replace(temp_file, self.usage_file)
+
+    def _update_next_reset_timestamp(self):
+        """
+        Calculates and sets the next quota reset timestamp based on the configured timezone.
+        The reset happens at 1 AM in the specified timezone.
+        """
+        try:
+            tz = pytz.timezone(self.timezone)
+        except pytz.UnknownTimeZoneError:
+            print(f"ERROR: Unknown timezone '{self.timezone}'. Defaulting to UTC.")
+            tz = pytz.utc
+
+        now = datetime.now(tz)
+
+        # Check if the current time has passed the last known reset time.
+        if self.next_reset_timestamp and now >= self.next_reset_timestamp:
+            print(f"INFO: Quota reset time ({self.next_reset_timestamp.isoformat()}) has passed.")
+            
+            data_changed = False
+            if self.rate_limited_keys:
+                print(f"INFO: Clearing rate-limited keys: {self.rate_limited_keys}")
+                self.rate_limited_keys.clear()
+                data_changed = True
+
+            # Reset daily token counts
+            print("INFO: Resetting daily token counts for all keys.")
+            if isinstance(self.usage_data, dict):
+                for key, models_data in self.usage_data.items():
+                    if isinstance(models_data, dict):
+                        for model, model_data in models_data.items():
+                            if isinstance(model_data, dict) and model_data.get("daily_tokens", 0) != 0:
+                                model_data["daily_tokens"] = 0
+                                data_changed = True
+            
+            if data_changed:
+                self._save_usage_data()
+        
+        # Reset time is 1 AM in the specified timezone.
+        # We use the quota_reset_datetime_str just to get a base date, then apply the time.
+        base_datetime = datetime.fromisoformat(self.quota_reset_datetime_str.split(' ')[0])
+        reset_time = tz.localize(base_datetime.replace(hour=1, minute=0, second=0, microsecond=0))
+
+        # Find the next reset time
+        next_reset = reset_time
+        while next_reset <= now:
+            next_reset += timedelta(days=1)
+
+        if self.next_reset_timestamp != next_reset:
+            self.next_reset_timestamp = next_reset
+            print(f"INFO: Next quota reset is scheduled for: {self.next_reset_timestamp.isoformat()}")
+            self._save_usage_data()
+
+    def check_and_reset_if_missed(self):
+        # This function can be used to implement daily token limits if needed in the future.
+        pass
+
+    def _get_total_tokens(self, key, model):
+        if not isinstance(key, str):
+            return 0
+        if key not in self.usage_data or model not in self.usage_data[key]:
+            return 0
+        # Return the persistent total_tokens count
+        return self.usage_data[key][model].get("total_tokens", 0)
+
+    def _is_model_temporarily_disabled(self, key, model):
+        """检查特定密钥的特定模型是否被临时禁用"""
+        if key not in self.usage_data or model not in self.usage_data[key]:
+            return False
+        
+        model_data = self.usage_data[key][model]
+        if not model_data.get("is_temporarily_disabled", False):
+            return False
+        
+        # 检查禁用时间是否已过期
+        disabled_until = model_data.get("disabled_until", 0)
+        if time.time() > disabled_until:
+            # 禁用时间已过期，恢复模型
+            model_data["is_temporarily_disabled"] = False
+            model_data["disabled_until"] = 0
+            model_data["consecutive_429_count"] = 0
+            self._save_usage_data()
+            print(f"INFO: Model '{model}' on key '{key[:4]}****' has been automatically re-enabled after timeout.")
+            return False
+        
+        return True
+
+    def _disable_model_temporarily(self, key, model, duration=None):
+        """临时禁用特定密钥的特定模型"""
+        if key not in self.usage_data:
+            self.usage_data[key] = {}
+        if model not in self.usage_data[key]:
+            self.usage_data[key][model] = {
+                "usage_records": [],
+                "total_tokens": 0,
+                "daily_tokens": 0,
+                "is_temporarily_disabled": False,
+                "disabled_until": 0,
+                "last_429_error": 0,
+                "consecutive_429_count": 0
+            }
+        
+        model_config = self.models_config.get(model, {})
+        disable_duration = duration or model_config.get("disable_duration", 300)
+        
+        self.usage_data[key][model]["is_temporarily_disabled"] = True
+        self.usage_data[key][model]["disabled_until"] = time.time() + disable_duration
+        self.usage_data[key][model]["last_429_error"] = time.time()
+        
+        # 更新model_specific_disabled跟踪
+        if key not in self.model_specific_disabled:
+            self.model_specific_disabled[key] = []
+        if model not in self.model_specific_disabled[key]:
+            self.model_specific_disabled[key].append(model)
+        
+        print(f"INFO: Temporarily disabled model '{model}' on key '{key[:4]}****' for {disable_duration} seconds.")
+        self._save_usage_data()
+
+    def _enable_model(self, key, model):
+        """启用特定密钥的特定模型"""
+        if key in self.usage_data and model in self.usage_data[key]:
+            self.usage_data[key][model]["is_temporarily_disabled"] = False
+            self.usage_data[key][model]["disabled_until"] = 0
+            self.usage_data[key][model]["consecutive_429_count"] = 0
+        
+        # 从model_specific_disabled中移除
+        if key in self.model_specific_disabled and model in self.model_specific_disabled[key]:
+            self.model_specific_disabled[key].remove(model)
+            if not self.model_specific_disabled[key]:  # 如果列表为空，删除该密钥
+                del self.model_specific_disabled[key]
+        
+        print(f"INFO: Re-enabled model '{model}' on key '{key[:4]}****'.")
+        self._save_usage_data()
+
+    def _get_disabled_models_for_key(self, key):
+        """获取特定密钥被禁用的模型列表"""
+        disabled_models = []
+        if key in self.usage_data:
+            for model in self.model_order:
+                if (model in self.usage_data[key] and 
+                    self.usage_data[key][model].get("is_temporarily_disabled", False)):
+                    disabled_models.append(model)
+        return disabled_models
+
+    def _cleanup_expired_disables(self):
+        """清理已过期的禁用状态"""
+        current_time = time.time()
+        cleaned_keys = []
+        
+        for key in list(self.model_specific_disabled.keys()):
+            models_to_remove = []
+            for model in self.model_specific_disabled[key]:
+                if (key in self.usage_data and model in self.usage_data[key]):
+                    model_data = self.usage_data[key][model]
+                    if (model_data.get("is_temporarily_disabled", False) and 
+                        current_time > model_data.get("disabled_until", 0)):
+                        models_to_remove.append(model)
+            
+            for model in models_to_remove:
+                self._enable_model(key, model)
+                cleaned_keys.append((key[:4] + "****", model))
+        
+        if cleaned_keys:
+            for key_masked, model in cleaned_keys:
+                print(f"INFO: Cleaned expired disable for model '{model}' on key '{key_masked}'.")
+        
+        return cleaned_keys
+
+    def _is_key_model_available(self, key, model):
+        """检查特定密钥的特定模型是否可用"""
+        # A key in rate_limited_keys is only unavailable for the 'gemini-2.5-pro' model.
+        # Other models on that key can still be borrowed.
+        if model == "gemini-2.5-pro" and key in self.rate_limited_keys:
+            return False
+        
+        # 检查模型是否被临时禁用
+        if self._is_model_temporarily_disabled(key, model):
+            return False
+        
+        # 检查token使用量是否超过限制
+        model_config = self.models_config.get(model, {})
+        tpm_limit = model_config.get("tpm_limit", float('inf'))
+        current_usage = self._get_tokens_in_last_minute(key, model)
+        
+        return current_usage < tpm_limit
+
+    def _get_available_keys_for_model(self, model):
+        """获取特定模型的所有可用密钥"""
+        available_keys = []
+        for key in self.all_keys:
+            if self._is_key_model_available(key, model):
+                available_keys.append(key)
+        return available_keys
+
+    def _check_and_recover_models(self):
+        """检查并恢复可用的模型"""
+        recovered_models = []
+        current_time = time.time()
+        
+        for key in self.all_keys:
+            if key not in self.usage_data:
+                continue
+                
+            for model in self.model_order:
+                if model not in self.usage_data[key]:
+                    continue
+                    
+                model_data = self.usage_data[key][model]
+                
+                # 检查临时禁用的模型是否可以恢复
+                if (model_data.get("is_temporarily_disabled", False) and 
+                    current_time > model_data.get("disabled_until", 0)):
+                    
+                    model_data["is_temporarily_disabled"] = False
+                    model_data["disabled_until"] = 0
+                    model_data["consecutive_429_count"] = 0
+                    recovered_models.append((key[:4] + "****", model))
+                
+                # 检查基于使用量的恢复条件
+                elif not model_data.get("is_temporarily_disabled", False):
+                    recovery_threshold = self.models_config.get(model, {}).get("recovery_threshold", 0)
+                    current_usage = self._get_tokens_in_last_minute(key, model)
+                    
+                    # 如果使用量降到恢复阈值以下，重置连续错误计数
+                    if current_usage < recovery_threshold and model_data.get("consecutive_429_count", 0) > 0:
+                        # We no longer reset the counter here. It's reset only on success.
+                        # model_data["consecutive_429_count"] = 0
+                        recovered_models.append((key[:4] + "****", model + " (usage-based recovery)"))
+        
+        if recovered_models:
+            self._save_usage_data()
+            for key_masked, model_info in recovered_models:
+                print(f"INFO: Model '{model_info}' on key '{key_masked}' has been recovered.")
+        
+        return recovered_models
+
+    def _can_model_recover(self, key, model):
+        """检查特定模型是否可以恢复"""
+        if key not in self.usage_data or model not in self.usage_data[key]:
+            return True
+        
+        model_data = self.usage_data[key][model]
+        current_time = time.time()
+        
+        # 检查时间基础的恢复
+        if (model_data.get("is_temporarily_disabled", False) and 
+            current_time > model_data.get("disabled_until", 0)):
+            return True
+        
+        # 检查使用量基础的恢复
+        recovery_threshold = self.models_config.get(model, {}).get("recovery_threshold", 0)
+        current_usage = self._get_tokens_in_last_minute(key, model)
+        
+        return current_usage < recovery_threshold
+
+    def _prioritize_recovery_models(self, requested_model):
+        """根据请求的模型优先级排序恢复检查"""
+        recovery_order = []
+        
+        # 首先检查请求的模型
+        if requested_model:
+            recovery_order.append(requested_model)
+        
+        # 然后按照fallback策略检查其他模型
+        fallback_models = self._get_model_fallback_order(requested_model or self.config.get('default_model', 'gemini-2.5-pro'))
+        for model in fallback_models:
+            if model not in recovery_order:
+                recovery_order.append(model)
+        
+        return recovery_order
+
+    def _get_model_recovery_status(self, key, model):
+        """获取模型的恢复状态信息"""
+        if key not in self.usage_data or model not in self.usage_data[key]:
+            return {
+                'is_available': True,
+                'current_usage': 0,
+                'recovery_threshold': self.models_config.get(model, {}).get('recovery_threshold', 0),
+                'is_temporarily_disabled': False,
+                'disabled_until': 0,
+                'consecutive_429_count': 0
+            }
+        
+        model_data = self.usage_data[key][model]
+        current_usage = self._get_tokens_in_last_minute(key, model)
+        recovery_threshold = self.models_config.get(model, {}).get('recovery_threshold', 0)
+        
+        return {
+            'is_available': self._is_key_model_available(key, model),
+            'current_usage': current_usage,
+            'recovery_threshold': recovery_threshold,
+            'is_temporarily_disabled': model_data.get("is_temporarily_disabled", False),
+            'disabled_until': model_data.get("disabled_until", 0),
+            'consecutive_429_count': model_data.get("consecutive_429_count", 0)
+        }
+
+    def get_key_status(self):
+        with self.lock:
+            self._check_and_recover_models()
+            
+            status = {}
+            grand_total_tokens = 0
+            
+            # Define daily quota limit from config, with a default
+            daily_quota_limit = self.config.get('daily_quota_limit', 2000000)
+
+            for key in self.all_keys:
+                status[key] = {}
+                key_daily_total = 0
+                for model in self.model_order:
+                    total_tokens = self._get_total_tokens(key, model)
+                    daily_tokens = self.usage_data.get(key, {}).get(model, {}).get("daily_tokens", 0)
+                    grand_total_tokens += total_tokens
+                    key_daily_total += daily_tokens
+
+                    basic_status = {
+                        'tokens_last_minute': self._get_tokens_in_last_minute(key, model),
+                        'total_tokens': total_tokens,
+                        'daily_tokens': daily_tokens,
+                    }
+                    recovery_status = self._get_model_recovery_status(key, model)
+                    status[key][model] = {**basic_status, **recovery_status}
+
+                # Check daily quota for the entire key
+                status[key]['daily_quota_exceeded'] = key_daily_total > daily_quota_limit if daily_quota_limit else False
+
+            current_key = self.all_keys[self.current_key_index] if self.all_keys and self.current_key_index < len(self.all_keys) else None
+
+            return {
+                'current_key': current_key,
+                'key_usage_status': status,
+                'unavailable_keys': self.unavailable_keys,
+                'rate_limited_keys': self.rate_limited_keys,
+                'model_specific_disabled': self.model_specific_disabled,
+                'model_order': self.model_order,
+                'priority_keys': self.priority_keys,
+                'secondary_keys': self.secondary_keys,
+                'models_config': self.models_config,
+                'grand_total_tokens': grand_total_tokens
+            }
+
+    # Functions for handling permanently unavailable keys (403 errors, etc.)
+    # These are kept from the original file for future use if needed.
     def handle_403_error(self, key_str):
         with self.lock:
             masked_key = f"{key_str[:4]}****{key_str[-6:]}"
@@ -161,174 +838,11 @@ class KeyManager:
                 self.potential_unavailable[key_str] = current_errors
             
             self._save_unavailable_data()
-            
-            # If the error was on the current key, force rotation
-            if self.current_key_info and self.current_key_info['key'] == key_str:
-                self.current_key_info = None
-                self._cancel_rotation_timer()
-
-    def handle_429_error(self, key_str):
-        with self.lock:
-            masked_key = f"{key_str[:4]}****{key_str[-6:]}"
-            print(f"ERROR: 429 Error (Rate Limit Exceeded) reported for key: {masked_key}")
-
-            # Mark the key's usage as exhausted
-            for key_info in self.all_keys_usage:
-                if key_info['key'] == key_str:
-                    key_info['usage'] = self.usage_limit
-                    print(f"INFO: Key {masked_key} usage marked as exhausted ({self.usage_limit}).")
-                    break
-            self._save_usage_data()
-
-            # If the error is on the current key, handle model switching or rotation
-            if self.current_key_info and self.current_key_info['key'] == key_str:
-                # If the key is already using the flash model, it has hit another 429.
-                # In this case, we set the rotation flag instead of calling _rotate_key directly
-                if self.current_key_info.get('model') == 'gemini-2.5-flash':
-                    print(f"INFO: Key {masked_key} received another 429 error on 'gemini-2.5-flash'. Setting rotation flag.")
-                    self.need_rotation = True
-                    # 确保新密钥使用默认模型
-                    if self.current_key_info:
-                        self.current_key_info['model'] = self.default_model
-                        print(f"DEBUG: Reset model to {self.default_model} after forced rotation")
-                else:
-                    # First 429 error, attempt to switch to the flash model.
-                    print(f"INFO: Attempting to switch model for key {masked_key} to 'gemini-2.5-flash'.")
-                    self.current_key_info['model'] = 'gemini-2.5-flash'
-                    self._start_rotation_timer()  # Start rotation timer for the new model
-            else:
-                # If the 429 error is not on the current key, just mark it as exhausted
-                print(f"INFO: Key {masked_key} is not the current key. Marked as exhausted.")
 
     def _remove_key_from_pools(self, key_str):
-        self.priority_pool = [k for k in self.priority_pool if k['key'] != key_str]
-        self.secondary_pool = [k for k in self.secondary_pool if k['key'] != key_str]
-        self.all_keys_usage = [k for k in self.all_keys_usage if k['key'] != key_str]
-
-    # --- Data Loading and Saving (largely unchanged but adapted) ---
-
-    def _load_usage_data(self, current_api_keys):
-        # 初始化默认值
-        stored_usage = {}
-        next_reset = None
-        
-        if os.path.exists(self.usage_file):
-            with open(self.usage_file, 'r') as f:
-                try:
-                    data = json.load(f)
-                    # 新格式包含使用情况和下次重置时间
-                    stored_usage = data.get('usage_data', {})
-                    next_reset_str = data.get('next_reset')
-                    next_reset = datetime.fromisoformat(next_reset_str) if next_reset_str else None
-                except json.JSONDecodeError:
-                    pass
-
-        # 处理旧格式迁移 (如果需要，这里可以添加旧格式的判断和迁移逻辑)
-        # 目前假设 usage_data 总是字典，如果不是，则需要更复杂的迁移逻辑
-        if isinstance(stored_usage, list):
-            print("DEBUG: Migrating old usage format to new structure")
-            stored_usage = {item['key']: item['usage'] for item in stored_usage if 'key' in item}
-            # 迁移后保存，确保下次加载是新格式
-            self._save_usage_data_internal({
-                'usage_data': stored_usage,
-                'next_reset': next_reset.isoformat() if next_reset else None
-            })
-
-        # 创建新的使用数据，合并当前API密钥
-        usage_data = []
-        for key in current_api_keys:
-            usage_data.append({
-                "key": key,
-                "usage": self._get_usage_value(stored_usage.get(key)),
-                "model": self.default_model # Initialize with default model
-            })
-            
-        return usage_data, next_reset
-
-    def _save_usage_data(self):
-        data_to_save = {item['key']: item['usage'] for item in self.all_keys_usage} # Save usage as a flat integer
-        self._save_usage_data_internal(data_to_save)
-
-    def _save_usage_data_internal(self, data_to_save):
-        # 构建包含下次重置时间的完整数据结构
-        full_data = {
-            'usage_data': data_to_save,
-            'next_reset': self.next_reset_timestamp.isoformat() if self.next_reset_timestamp else None
-        }
-        
-        temp_file = self.usage_file + '.tmp'
-        with open(temp_file, 'w') as f:
-            json.dump(full_data, f, indent=4)
-        os.replace(temp_file, self.usage_file)
-
-    def reset_all_keys(self):
-        with self.lock:
-            print("Resetting all API key usage counts.")
-            for key_info in self.all_keys_usage:
-                key_info['usage'] = 0
-                key_info['model'] = self.default_model # Reset model to default
-            self._save_usage_data()
-            # Also reset the current key to force re-selection
-            self.current_key_info = None
-            self._cancel_rotation_timer()
-            # 重置后立即更新下次重置时间
-            self._update_next_reset_timestamp()
-
-    def get_key_status(self):
-        with self.lock:
-            return {
-                'current_key': self.current_key_info,
-                'priority_pool_status': self.priority_pool,
-                'secondary_pool_status': self.secondary_pool,
-                'potential_unavailable': self.potential_unavailable,
-                'unavailable_keys': self.unavailable_keys,
-                'next_reset': self.next_reset_timestamp.isoformat() if self.next_reset_timestamp else None
-            }
-
-    def _update_next_reset_timestamp(self):
-        with self.lock:
-            tz = pytz.timezone(self.timezone)
-            now = datetime.now(tz)
-            
-            # 解析配置中的完整日期时间字符串
-            try:
-                initial_reset_dt = tz.localize(datetime.strptime(self.quota_reset_datetime_str, '%Y-%m-%d %H:%M'))
-            except ValueError:
-                print(f"WARNING: Invalid quota_reset_datetime format in config. Using current time for initial reset. Format should be YYYY-MM-DD HH:MM. Config value: {self.quota_reset_datetime_str}")
-                initial_reset_dt = now.replace(hour=0, minute=0, second=0, microsecond=0) # Default to start of today
-
-            # 如果当前时间已经过了初始重置时间，则计算下一个重置点
-            # 每次重置都是在 initial_reset_dt 的时间点，但日期会根据当前日期调整
-            if now >= initial_reset_dt:
-                # 如果当前时间已经过了配置的日期时间，则将日期推迟到明天或下一个重置周期
-                # 确保重置时间点是未来的
-                while initial_reset_dt <= now:
-                    initial_reset_dt += timedelta(days=1)
-                self.next_reset_timestamp = initial_reset_dt
-            else:
-                self.next_reset_timestamp = initial_reset_dt
-            
-            print(f"DEBUG: Updated next reset timestamp to {self.next_reset_timestamp.strftime('%Y-%m-%d %H:%M:%S%z')}")
-            self._save_usage_data() # 保存更新后的下次重置时间
-
-    def check_and_reset_if_missed(self):
-        with self.lock:
-            tz = pytz.timezone(self.timezone)
-            now = datetime.now(tz)
-            print(f"DEBUG: Current time in {self.timezone}: {now.strftime('%Y-%m-%d %H:%M:%S%z')}")
-            
-            # 确保 next_reset_timestamp 已经被初始化
-            if not self.next_reset_timestamp:
-                self._update_next_reset_timestamp()
-            
-            # 如果当前时间已经超过了预定的下次重置时间
-            if now >= self.next_reset_timestamp:
-                print(f"INFO: Performing scheduled reset at {self.next_reset_timestamp.strftime('%Y-%m-%d %H:%M:%S%z')}")
-                self.reset_all_keys()
-                # 重置后，立即计算并更新下一次的重置时间
-                self._update_next_reset_timestamp()
-            else:
-                print(f"INFO: Next reset scheduled at {self.next_reset_timestamp.strftime('%Y-%m-%d %H:%M:%S%z')} (current time: {now.strftime('%Y-%m-%d %H:%M:%S%z')})")
+        self.priority_keys = [k for k in self.priority_keys if k != key_str]
+        self.secondary_keys = [k for k in self.secondary_keys if k != key_str]
+        self.all_keys = [k for k in self.all_keys if k != key_str]
 
     def _load_potential_unavailable(self):
         if not os.path.exists(self.unavailable_file):
@@ -368,9 +882,3 @@ class KeyManager:
             f.seek(0)
             f.truncate()
             json.dump(config, f, indent=2)
-
-    def _get_usage_value(self, value):
-        """Helper to extract usage from old/new formats."""
-        if isinstance(value, dict) and 'usage' in value:
-            return value['usage']
-        return value if isinstance(value, int) else 0

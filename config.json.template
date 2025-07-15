@@ -6,11 +6,39 @@
   "secondary_keys": [
     "put_your_low_priority_api_key_here_1"
   ],
+    "models": {
+    "gemini-2.5-pro": {
+      "tpm_limit": 250000,
+      "tpd_limit": 6000000,
+      "recovery_threshold": 80000
+    },
+    "gemini-2.5-flash": {
+      "tpm_limit": 250000,
+      "tpd_limit": null,
+      "recovery_threshold": 80000
+    },
+    "gemini-2.0-flash": {
+      "tpm_limit": 1000000,
+      "tpd_limit": null,
+      "recovery_threshold": 500000
+    },
+    "gemini-2.0-flash-lite": {
+      "tpm_limit": 1000000,
+      "tpd_limit": null,
+      "recovery_threshold": 500000
+    },
+    "gemini-1.5-flash": {
+      "tpm_limit": 250000,
+      "tpd_limit": null,
+      "recovery_threshold": 80000
+    }
+  },
   "usage_limit_per_key": 100,
   "switch_threshold": 40,
   "rotation_timeout": 30,
   "low_quota_threshold": 40,
   "quota_reset_datetime": "2025-07-15 00:00",
   "timezone": "America/Los_Angeles",
-  "default_model":"gemini-2.5-pro"
+  "default_model":"gemini-2.5-pro",
+  "usage_record_retention_seconds": 86400
 }

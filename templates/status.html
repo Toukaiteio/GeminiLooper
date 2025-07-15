@@ -8,77 +8,125 @@
     <style>
         body {
             background-color: #f8f9fa;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
         }
         .container {
-            max-width: 800px;
+            max-width: 960px;
         }
         .card {
             margin-bottom: 1.5rem;
+            box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075);
         }
-        .progress-bar {
-            transition: width 0.6s ease;
+        .progress {
+            height: 1.25rem;
+            font-size: 0.75rem;
         }
         .key-active {
             border: 2px solid #0d6efd;
+            box-shadow: 0 0 10px rgba(13, 110, 253, 0.25);
         }
+        .table th, .table td {
+            vertical-align: middle;
+        }
+        .model-name {
+            font-weight: 500;
+        }
+        .unavailable-key {
+            opacity: 0.6;
+            border: 2px dashed #6c757d;
+        }
+        .unavailable-badge {
+            font-size: 0.8rem;
+        }
+       .quota-exceeded {
+           border: 2px solid #dc3545 !important;
+           box-shadow: 0 0 10px rgba(220, 53, 69, 0.25);
+       }
     </style>
 </head>
 <body>
     <div class="container mt-5">
-        <h1 class="mb-4 text-center">API Key Usage Status</h1>
+       <h1 class="mb-4 text-center">API Key Usage Status</h1>
 
-        {% if current_masked_key %}
-        <div class="alert alert-info" role="alert">
+       <div class="card mb-4">
+           <div class="card-body text-center">
+               <h5 class="card-title">Total Tokens Consumed</h5>
+               <p class="card-text fs-4 fw-bold">{{ "{:,.0f}".format(grand_total_tokens) }}</p>
+           </div>
+       </div>
+
+        {% if current_masked_key and current_masked_key != "None" %}
+        <div class="alert alert-info text-center" role="alert">
             <strong>Current Active Key:</strong> {{ current_masked_key }}
+        </div>
+        {% else %}
+        <div class="alert alert-warning text-center" role="alert">
+            <strong>No active key. All keys might be rate-limited.</strong>
         </div>
         {% endif %}
 
-        <div class="card">
-            <div class="card-header">
-                Priority Keys
+        {% for key_type, keys in [('Priority Keys', priority_keys), ('Secondary Keys', secondary_keys)] %}
+        <h2 class="h4 mt-5">{{ key_type }}</h2>
+        {% if keys %}
+            {% for key in keys %}
+            {% set masked_key = key[:4] + '...' + key[-4:] %}
+            {% set key_status = key_usage_status.get(key) %}
+            <div class="card {% if masked_key == current_masked_key %}key-active{% endif %} {% if key_status and key_status.daily_quota_exceeded %}quota-exceeded{% endif %}">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <strong>{{ masked_key }}</strong>
+                    {% if key_status and key_status.daily_quota_exceeded %}
+                        <span class="badge bg-danger">Daily Quota Exceeded</span>
+                    {% endif %}
+                </div>
+                <div class="card-body">
+                    <table class="table table-sm table-hover">
+                        <thead>
+                            <tr>
+                                <th scope="col">Model</th>
+                                <th scope="col" style="width: 40%;">Tokens (Last 60s)</th>
+                                <th scope="col">Total Tokens Used</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for model in model_order %}
+                            {% set usage = key_usage_status[key][model] %}
+                            {% set model_config = models_config.get(model, {}) %}
+                            {% set tpm_limit = model_config.get('tpm_limit', 1) %}
+                            {% set percentage = (usage.tokens_last_minute / tpm_limit) * 100 if tpm_limit > 0 else 0 %}
+                            <tr>
+                                <td class="model-name">{{ model }}</td>
+                                <td>
+                                    <div class="progress">
+                                        <div class="progress-bar {% if percentage > 90 %}bg-danger{% elif percentage > 70 %}bg-warning{% else %}bg-success{% endif %}" role="progressbar" style="width: {{ percentage }}%;" aria-valuenow="{{ usage.tokens_last_minute }}" aria-valuemin="0" aria-valuemax="{{ tpm_limit }}">
+                                            {{ usage.tokens_last_minute }} / {{ tpm_limit }}
+                                        </div>
+                                    </div>
+                                </td>
+                                <td>{{ usage.total_tokens }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
             </div>
-            <div class="card-body">
-                {% if priority_keys %}
-                    {% for key in priority_keys %}
-                    <div class="mb-3 {% if key.masked_key == current_masked_key %}key-active p-2 rounded{% endif %}">
-                        <strong>{{ key.masked_key }}</strong>
-                        <div class="progress mt-1" style="height: 20px;">
-                            {% set percentage = (key.usage / usage_limit) * 100 %}
-                            <div class="progress-bar" role="progressbar" style="width: {{ percentage }}%;" aria-valuenow="{{ key.usage }}" aria-valuemin="0" aria-valuemax="{{ usage_limit }}">
-                                {{ key.usage }} / {{ usage_limit }}
-                            </div>
-                        </div>
-                    </div>
-                    {% endfor %}
-                {% else %}
-                    <p class="text-muted">No priority keys configured.</p>
-                {% endif %}
-            </div>
-        </div>
+            {% endfor %}
+        {% else %}
+            <p class="text-muted">No {{ key_type.lower() }} configured.</p>
+        {% endif %}
+        {% endfor %}
 
-        <div class="card">
-            <div class="card-header">
-                Secondary Keys
-            </div>
+        {% if unavailable_keys %}
+        <h2 class="h4 mt-5">Unavailable Keys</h2>
+        <div class="card unavailable-key">
             <div class="card-body">
-                {% if secondary_keys %}
-                    {% for key in secondary_keys %}
-                    <div class="mb-3 {% if key.masked_key == current_masked_key %}key-active p-2 rounded{% endif %}">
-                        <strong>{{ key.masked_key }}</strong>
-                        <div class="progress mt-1" style="height: 20px;">
-                            {% set percentage = (key.usage / usage_limit) * 100 %}
-                            <div class="progress-bar bg-secondary" role="progressbar" style="width: {{ percentage }}%;" aria-valuenow="{{ key.usage }}" aria-valuemin="0" aria-valuemax="{{ usage_limit }}">
-                                {{ key.usage }} / {{ usage_limit }}
-                            </div>
-                        </div>
-                    </div>
-                    {% endfor %}
-                {% else %}
-                    <p class="text-muted">No secondary keys configured.</p>
-                {% endif %}
+                {% for key in unavailable_keys %}
+                    <span class="badge bg-danger unavailable-badge me-2">{{ key[:4] + '...' + key[-4:] }}</span>
+                {% endfor %}
             </div>
         </div>
-        <footer class="text-center text-muted mt-4">
+        {% endif %}
+
+        <footer class="text-center text-muted mt-4 py-3">
             <p>Page auto-refreshes every 10 seconds.</p>
         </footer>
     </div>

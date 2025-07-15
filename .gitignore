@@ -3,3 +3,7 @@ key_usage.json
 unavailale.json
 .venv/
 __pycache__/
+*.md
+test_*.py
+demo_*.py
+doc/

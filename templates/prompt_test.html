@@ -94,83 +94,68 @@
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
     <script>
-        const GOOGLE_API_BASE_URL = "https://generativelanguage.googleapis.com"; // Must match app.py
-        const testPrompt = "Hello, what is your name?"; // Simple test prompt
-
-        async function testKey(key, model, resultSpan) {
-            resultSpan.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> Testing...';
-            resultSpan.classList.remove('result-success', 'result-warning', 'result-danger');
-
-            try {
-                const url = `${GOOGLE_API_BASE_URL}/v1beta/models/${model}:generateContent?key=${key}`;
-                const payload = {
-                    contents: [{
-                        parts: [{
-                            text: testPrompt
-                        }]
-                    }]
-                };
-                
-                const response = await fetch(url, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify(payload)
-                });
-
-                if (response.ok) {
-                    resultSpan.innerHTML = `<span class="result-success">OK (200)</span>`;
-                } else if (response.status === 403) {
-                    const errorText = await response.text();
-                    resultSpan.innerHTML = `<span class="result-danger">ERROR 403: Forbidden!</span>`;
-                    console.error(`Key ${key.substring(0,4)}...${key.substring(key.length-4)} - 403 Error: ${errorText}`);
-                } else {
-                    const errorText = await response.text();
-                    resultSpan.innerHTML = `<span class="result-warning">ERROR ${response.status}</span>`;
-                    console.error(`Key ${key.substring(0,4)}...${key.substring(key.length-4)} - Error ${response.status}: ${errorText}`);
-                }
-            } catch (error) {
-                resultSpan.innerHTML = `<span class="result-danger">Network Error</span>`;
-                console.error(`Key ${key.substring(0,4)}...${key.substring(key.length-4)} - Network Error: ${error}`);
-            }
-        }
-
         document.addEventListener('DOMContentLoaded', () => {
             const modelSelect = document.getElementById('model-select');
-            // Set default selected model
-            modelSelect.value = 'gemini-1.5-flash'; 
+            const promptInput = document.getElementById('prompt-input');
+            const sendBtn = document.getElementById('send-prompt-btn');
+            const responseOutput = document.getElementById('response-output');
+            const spinner = sendBtn.querySelector('.spinner-border');
 
-            const allKeys = [];
-            document.querySelectorAll('.key-card').forEach(card => {
-                allKeys.push({
-                    key: card.dataset.key,
-                    resultSpan: card.querySelector('.test-result')
-                });
-
-                card.querySelector('.test-single-key-btn').addEventListener('click', (event) => {
-                    const key = card.dataset.key;
-                    const model = modelSelect.value;
-                    testKey(key, model, card.querySelector('.test-result'));
-                });
-            });
-
-            document.getElementById('test-all-keys-btn').addEventListener('click', async () => {
+            sendBtn.addEventListener('click', async () => {
                 const model = modelSelect.value;
-                const testAllBtn = document.getElementById('test-all-keys-btn');
-                const spinner = testAllBtn.querySelector('.spinner-border');
+                const prompt = promptInput.value;
 
-                testAllBtn.disabled = true;
-                spinner.style.display = 'inline-block';
-
-                for (const keyInfo of allKeys) {
-                    await testKey(keyInfo.key, model, keyInfo.resultSpan);
-                    // Small delay to prevent overwhelming the API or UI
-                    await new Promise(resolve => setTimeout(resolve, 100)); 
+                if (!prompt) {
+                    alert('Please enter a prompt.');
+                    return;
                 }
 
-                testAllBtn.disabled = false;
-                spinner.style.display = 'none';
+                sendBtn.disabled = true;
+                spinner.style.display = 'inline-block';
+                responseOutput.textContent = 'Sending request...';
+
+                try {
+                    // The URL path here should match a route in app.py
+                    // The model is now selected on the backend, but we pass it for preference
+                    const url = `/v1beta/models/${model}:generateContent`;
+                    
+                    const payload = {
+                        contents: [{
+                            parts: [{
+                                text: prompt
+                            }]
+                        }]
+                    };
+
+                    const response = await fetch(url, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify(payload)
+                    });
+
+                    const responseText = await response.text();
+
+                    if (response.ok) {
+                        // Try to parse and format the JSON response
+                        try {
+                            const jsonResponse = JSON.parse(responseText);
+                            responseOutput.textContent = JSON.stringify(jsonResponse, null, 2);
+                        } catch {
+                            // If it's not JSON, just show the raw text
+                            responseOutput.textContent = responseText;
+                        }
+                    } else {
+                        responseOutput.textContent = `Error ${response.status}: ${responseText}`;
+                    }
+
+                } catch (error) {
+                    responseOutput.textContent = `Network Error: ${error}`;
+                } finally {
+                    sendBtn.disabled = false;
+                    spinner.style.display = 'none';
+                }
             });
         });
     </script>
