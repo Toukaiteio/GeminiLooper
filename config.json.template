@@ -10,5 +10,7 @@
   "switch_threshold": 40,
   "rotation_timeout": 30,
   "low_quota_threshold": 40,
-  "quota_reset_time": "00:05"
+  "quota_reset_datetime": "2025-07-15 00:00",
+  "timezone": "America/Los_Angeles",
+  "default_model":"gemini-2.5-pro"
 }

@@ -11,6 +11,7 @@ class KeyManager:
         self.usage_file = usage_file
         self.unavailable_file = unavailable_file
         self.lock = threading.Lock()
+        self.need_rotation = False  # Flag for deferred key rotation
 
         # Load configuration
         with open(config_path) as f:
@@ -22,6 +23,7 @@ class KeyManager:
         self.low_quota_threshold = config.get('low_quota_threshold', 40)
         self.quota_reset_datetime_str = config.get('quota_reset_datetime', '2025-01-01 00:00') # New field
         self.timezone = config.get('timezone', 'America/Los_Angeles')
+        self.default_model = config.get('default_model', 'gemini-pro') # New field for default model
 
         # Load unavailable keys
         self.potential_unavailable = self._load_potential_unavailable()
@@ -45,10 +47,18 @@ class KeyManager:
 
     def get_key(self):
         with self.lock:
+            # Check if rotation is needed
+            if self.need_rotation:
+                print("DEBUG: Rotation flag detected. Performing deferred rotation.")
+                self._rotate_key()
+                self.need_rotation = False
+                if not self.current_key_info:
+                    return None
+
             # If there's an active key, reset the rotation timer and return it
             if self.current_key_info:
                 self._reset_rotation_timer()
-                print(f"DEBUG: Sticking with key {self.current_key_info['key'][:4]}****")
+                print(f"DEBUG: Sticking with key {self.current_key_info['key'][:4]}**** with model {self.current_key_info.get('model', self.default_model)}")
                 return self.current_key_info
 
             # If no active key, select a new one
@@ -58,7 +68,7 @@ class KeyManager:
                 return None
             
             self.current_key_info = new_key_info
-            print(f"DEBUG: Selected new key {self.current_key_info['key'][:4]}****")
+            print(f"DEBUG: Selected new key {self.current_key_info['key'][:4]}**** with model {self.current_key_info.get('model', self.default_model)}")
             return self.current_key_info
 
     def increment_usage(self, key_str):
@@ -88,20 +98,24 @@ class KeyManager:
         # If there are priority keys with high quota, use the one with the least usage
         if priority_with_high_quota:
             print("DEBUG: Selecting from priority keys with high quota.")
-            return min(priority_with_high_quota, key=lambda k: k['usage'])
+            selected_key = min(priority_with_high_quota, key=lambda k: k['usage'])
+            selected_key['model'] = self.default_model # Assign default model
+            return selected_key
         
         # Otherwise, use any available key (priority or secondary), picking the one with least usage
         all_active_keys = active_priority + active_secondary
         if all_active_keys:
             print("DEBUG: No high-quota priority keys. Selecting from all available keys.")
-            return min(all_active_keys, key=lambda k: k['usage'])
+            selected_key = min(all_active_keys, key=lambda k: k['usage'])
+            selected_key['model'] = self.default_model # Assign default model
+            return selected_key
 
         return None
 
     def _start_rotation_timer(self):
         self._cancel_rotation_timer() # Cancel any existing timer
-        self.rotation_timer = threading.Timer(self.rotation_timeout, self._rotate_key)
-        self.rotation_timer.start()
+        # 动态计算退避时间
+        retry_count = getattr(self.current_key_info, 'retry_count', 0) + 1
         print(f"DEBUG: Switch threshold reached for key {self.current_key_info['key'][:4]}****. Starting {self.rotation_timeout}s rotation timer.")
 
     def _reset_rotation_timer(self):
@@ -114,10 +128,16 @@ class KeyManager:
             self.rotation_timer = None
 
     def _rotate_key(self):
-        with self.lock:
+        if self.current_key_info:
             print(f"DEBUG: Rotation timer expired. Releasing key {self.current_key_info['key'][:4]}****.")
             self.current_key_info = None
             self._cancel_rotation_timer()
+            # 强制立即获取新密钥
+            new_key = self._select_new_key()
+            if new_key:
+                self.current_key_info = new_key
+                print(f"DEBUG: Auto-rotated to new key {self.current_key_info['key'][:4]}****")
+                self._start_rotation_timer()
 
     def handle_403_error(self, key_str):
         with self.lock:
@@ -146,6 +166,39 @@ class KeyManager:
             if self.current_key_info and self.current_key_info['key'] == key_str:
                 self.current_key_info = None
                 self._cancel_rotation_timer()
+
+    def handle_429_error(self, key_str):
+        with self.lock:
+            masked_key = f"{key_str[:4]}****{key_str[-6:]}"
+            print(f"ERROR: 429 Error (Rate Limit Exceeded) reported for key: {masked_key}")
+
+            # Mark the key's usage as exhausted
+            for key_info in self.all_keys_usage:
+                if key_info['key'] == key_str:
+                    key_info['usage'] = self.usage_limit
+                    print(f"INFO: Key {masked_key} usage marked as exhausted ({self.usage_limit}).")
+                    break
+            self._save_usage_data()
+
+            # If the error is on the current key, handle model switching or rotation
+            if self.current_key_info and self.current_key_info['key'] == key_str:
+                # If the key is already using the flash model, it has hit another 429.
+                # In this case, we set the rotation flag instead of calling _rotate_key directly
+                if self.current_key_info.get('model') == 'gemini-2.5-flash':
+                    print(f"INFO: Key {masked_key} received another 429 error on 'gemini-2.5-flash'. Setting rotation flag.")
+                    self.need_rotation = True
+                    # 确保新密钥使用默认模型
+                    if self.current_key_info:
+                        self.current_key_info['model'] = self.default_model
+                        print(f"DEBUG: Reset model to {self.default_model} after forced rotation")
+                else:
+                    # First 429 error, attempt to switch to the flash model.
+                    print(f"INFO: Attempting to switch model for key {masked_key} to 'gemini-2.5-flash'.")
+                    self.current_key_info['model'] = 'gemini-2.5-flash'
+                    self._start_rotation_timer()  # Start rotation timer for the new model
+            else:
+                # If the 429 error is not on the current key, just mark it as exhausted
+                print(f"INFO: Key {masked_key} is not the current key. Marked as exhausted.")
 
     def _remove_key_from_pools(self, key_str):
         self.priority_pool = [k for k in self.priority_pool if k['key'] != key_str]
@@ -186,13 +239,14 @@ class KeyManager:
         for key in current_api_keys:
             usage_data.append({
                 "key": key,
-                "usage": stored_usage.get(key, 0)
+                "usage": self._get_usage_value(stored_usage.get(key)),
+                "model": self.default_model # Initialize with default model
             })
             
         return usage_data, next_reset
 
     def _save_usage_data(self):
-        data_to_save = {item['key']: item['usage'] for item in self.all_keys_usage}
+        data_to_save = {item['key']: item['usage'] for item in self.all_keys_usage} # Save usage as a flat integer
         self._save_usage_data_internal(data_to_save)
 
     def _save_usage_data_internal(self, data_to_save):
@@ -212,6 +266,7 @@ class KeyManager:
             print("Resetting all API key usage counts.")
             for key_info in self.all_keys_usage:
                 key_info['usage'] = 0
+                key_info['model'] = self.default_model # Reset model to default
             self._save_usage_data()
             # Also reset the current key to force re-selection
             self.current_key_info = None
@@ -313,3 +368,9 @@ class KeyManager:
             f.seek(0)
             f.truncate()
             json.dump(config, f, indent=2)
+
+    def _get_usage_value(self, value):
+        """Helper to extract usage from old/new formats."""
+        if isinstance(value, dict) and 'usage' in value:
+            return value['usage']
+        return value if isinstance(value, int) else 0

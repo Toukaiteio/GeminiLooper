@@ -107,6 +107,7 @@ def proxy(path):
         return jsonify({"error": "All API keys are currently unavailable or have reached their usage limit."}), 503
 
     api_key = key_info['key']
+    model = key_info.get('model', key_manager.default_model) # Get model from key_info, fallback to default
     target_url = f"{GOOGLE_API_BASE_URL}/{path}"
     params = request.args.to_dict()
     params['key'] = api_key
@@ -129,11 +130,9 @@ def proxy(path):
         is_flash_model = 'flash' in model_name_in_path
 
         if 200 <= resp.status_code < 300:
-            if not is_flash_model:
-                key_manager.increment_usage(api_key)
+            key_manager.increment_usage(api_key) # Increment usage for successful requests
         elif resp.status_code == 429:
-            # Treat 429 as a usage increment to potentially rotate the key, regardless of model type
-            key_manager.increment_usage(api_key)
+            key_manager.handle_429_error(api_key)
         elif resp.status_code == 403:
             key_manager.handle_403_error(api_key)
 
