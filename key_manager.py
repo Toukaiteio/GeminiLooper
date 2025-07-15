@@ -10,7 +10,7 @@ class KeyManager:
         self.config_path = config_path
         self.usage_file = usage_file
         self.unavailable_file = unavailable_file
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.need_rotation = False  # Flag for deferred key rotation
 
         # Load configuration
