@@ -40,9 +40,35 @@ def status():
 
 @app.route('/prompt_test', methods=['GET'])
 def prompt_test():
-    # This page is now more for initiating prompts. Status page shows key details.
-    return render_template('prompt_test.html')
+    status_data = key_manager.get_key_status()
+    return render_template('prompt_test.html',
+                           priority_keys=status_data.get('priority_keys', []),
+                           secondary_keys=status_data.get('secondary_keys', []))
 
+@app.route('/test_key', methods=['POST'])
+def test_key():
+    data = request.get_json()
+    key = data.get('key')
+    model = data.get('model')
+
+    if not key or not model:
+        return jsonify({'success': False, 'error': 'Missing key or model'}), 400
+
+    test_url = f"{GOOGLE_API_BASE_URL}/v1beta/models/{model}:generateContent"
+    test_payload = {
+        "contents": [{"parts": [{"text": "请仅回复ok"}]}]
+    }
+    params = {'key': key}
+
+    try:
+        response = requests.post(test_url, params=params, json=test_payload, timeout=20)
+        if response.status_code == 200:
+            return jsonify({'success': True})
+        else:
+            error_info = response.json().get('error', {})
+            return jsonify({'success': False, 'error': error_info.get('message', 'Unknown error')}), 200
+    except requests.exceptions.RequestException as e:
+        return jsonify({'success': False, 'error': str(e)}), 200
 @app.route('/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
 def proxy(path):
     request_data_bytes = request.get_data()

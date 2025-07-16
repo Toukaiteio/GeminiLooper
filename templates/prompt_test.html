@@ -58,11 +58,12 @@
             <div class="card-body" id="priority-keys-container">
                 {% if priority_keys %}
                     {% for key in priority_keys %}
-                    <div class="key-card d-flex justify-content-between align-items-center" data-key="{{ key.key }}">
-                        <span>{{ key.masked_key }}</span>
+                    {% set masked_key = key[:4] + '...' + key[-4:] %}
+                    <div class="key-card d-flex justify-content-between align-items-center" data-key="{{ key }}">
+                        <span>{{ masked_key }}</span>
                         <div>
                             <button class="btn btn-sm btn-info test-single-key-btn">Test</button>
-                            <span class="test-result ms-2" id="result-{{ key.key }}"></span>
+                            <span class="test-result ms-2" id="result-{{ key }}"></span>
                         </div>
                     </div>
                     {% endfor %}
@@ -77,11 +78,12 @@
             <div class="card-body" id="secondary-keys-container">
                 {% if secondary_keys %}
                     {% for key in secondary_keys %}
-                    <div class="key-card d-flex justify-content-between align-items-center" data-key="{{ key.key }}">
-                        <span>{{ key.masked_key }}</span>
+                    {% set masked_key = key[:4] + '...' + key[-4:] %}
+                    <div class="key-card d-flex justify-content-between align-items-center" data-key="{{ key }}">
+                        <span>{{ masked_key }}</span>
                         <div>
                             <button class="btn btn-sm btn-secondary test-single-key-btn">Test</button>
-                            <span class="test-result ms-2" id="result-{{ key.key }}"></span>
+                            <span class="test-result ms-2" id="result-{{ key }}"></span>
                         </div>
                     </div>
                     {% endfor %}
@@ -96,66 +98,81 @@
     <script>
         document.addEventListener('DOMContentLoaded', () => {
             const modelSelect = document.getElementById('model-select');
-            const promptInput = document.getElementById('prompt-input');
-            const sendBtn = document.getElementById('send-prompt-btn');
-            const responseOutput = document.getElementById('response-output');
-            const spinner = sendBtn.querySelector('.spinner-border');
+            const testAllBtn = document.getElementById('test-all-keys-btn');
 
-            sendBtn.addEventListener('click', async () => {
-                const model = modelSelect.value;
-                const prompt = promptInput.value;
-
-                if (!prompt) {
-                    alert('Please enter a prompt.');
+            const testKey = async (key, model) => {
+                const resultSpan = document.querySelector(`[id="result-${key}"]`);
+                if (!resultSpan) {
+                    console.error(`Could not find result span for key: ${key}`);
                     return;
                 }
 
-                sendBtn.disabled = true;
-                spinner.style.display = 'inline-block';
-                responseOutput.textContent = 'Sending request...';
+                const keyCard = resultSpan.closest('.key-card');
+                const singleTestBtn = keyCard.querySelector('.test-single-key-btn');
+
+                if (singleTestBtn) {
+                    singleTestBtn.innerHTML = `<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span>`;
+                    singleTestBtn.disabled = true;
+                }
+                resultSpan.textContent = '';
+                resultSpan.className = 'test-result ms-2';
 
                 try {
-                    // The URL path here should match a route in app.py
-                    // The model is now selected on the backend, but we pass it for preference
-                    const url = `/v1beta/models/${model}:generateContent`;
-                    
-                    const payload = {
-                        contents: [{
-                            parts: [{
-                                text: prompt
-                            }]
-                        }]
-                    };
-
-                    const response = await fetch(url, {
+                    const response = await fetch('/test_key', {
                         method: 'POST',
                         headers: {
                             'Content-Type': 'application/json',
                         },
-                        body: JSON.stringify(payload)
+                        body: JSON.stringify({ key: key, model: model }),
                     });
 
-                    const responseText = await response.text();
+                    const data = await response.json();
 
-                    if (response.ok) {
-                        // Try to parse and format the JSON response
-                        try {
-                            const jsonResponse = JSON.parse(responseText);
-                            responseOutput.textContent = JSON.stringify(jsonResponse, null, 2);
-                        } catch {
-                            // If it's not JSON, just show the raw text
-                            responseOutput.textContent = responseText;
-                        }
+                    if (response.ok && data.success) {
+                        resultSpan.textContent = 'Available';
+                        resultSpan.classList.add('result-success');
                     } else {
-                        responseOutput.textContent = `Error ${response.status}: ${responseText}`;
+                        resultSpan.textContent = data.error || 'Unavailable';
+                        resultSpan.classList.add('result-danger');
                     }
-
                 } catch (error) {
-                    responseOutput.textContent = `Network Error: ${error}`;
+                    console.error('Test key error:', error);
+                    resultSpan.textContent = 'Error';
+                    resultSpan.classList.add('result-danger');
                 } finally {
-                    sendBtn.disabled = false;
-                    spinner.style.display = 'none';
+                    if (singleTestBtn) {
+                        singleTestBtn.textContent = 'Test';
+                        singleTestBtn.disabled = false;
+                    }
                 }
+            };
+
+            document.querySelectorAll('.test-single-key-btn').forEach(button => {
+                button.addEventListener('click', (event) => {
+                    const keyCard = event.target.closest('.key-card');
+                    const key = keyCard.dataset.key;
+                    const model = modelSelect.value;
+                    testKey(key, model);
+                });
+            });
+
+            testAllBtn.addEventListener('click', async () => {
+                const testAllSpinner = testAllBtn.querySelector('.spinner-border');
+                testAllBtn.disabled = true;
+                testAllSpinner.style.display = 'inline-block';
+                
+                const model = modelSelect.value;
+                const keyCards = document.querySelectorAll('.key-card');
+
+                const testPromises = Array.from(keyCards).map(card => {
+                    const key = card.dataset.key;
+                    return testKey(key, model);
+                });
+
+                await Promise.all(testPromises);
+
+                testAllBtn.disabled = false;
+                testAllSpinner.style.display = 'none';
             });
         });
     </script>
