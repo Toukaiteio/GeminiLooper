@@ -3,138 +3,489 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>API Key Status</title>
+    <title>API Key Status Dashboard</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
     <style>
+        :root {
+            --bs-primary-rgb: 13, 110, 253;
+            --bs-success-rgb: 25, 135, 84;
+            --bs-warning-rgb: 255, 193, 7;
+            --bs-danger-rgb: 220, 53, 69;
+        }
         body {
-            background-color: #f8f9fa;
+            background-color: #f0f2f5;
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
         }
-        .container {
-            max-width: 960px;
+        .container-fluid {
+            padding: 1.5rem;
         }
         .card {
-            margin-bottom: 1.5rem;
-            box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075);
+            border: none;
+            border-radius: 0.75rem;
+            box-shadow: 0 0.5rem 1rem rgba(0, 0, 0, 0.05);
+            transition: transform 0.2s ease-in-out, box-shadow 0.2s ease-in-out;
+            background-color: #fff;
         }
-        .progress {
-            height: 1.25rem;
-            font-size: 0.75rem;
+        .card:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 0.75rem 1.5rem rgba(0, 0, 0, 0.08);
+        }
+        .card-header {
+            background-color: transparent;
+            border-bottom: 1px solid #e9ecef;
+            font-weight: 600;
         }
         .key-active {
-            border: 2px solid #0d6efd;
-            box-shadow: 0 0 10px rgba(13, 110, 253, 0.25);
+            border: 2px solid rgba(var(--bs-primary-rgb), 0.7);
+            box-shadow: 0 0 12px rgba(var(--bs-primary-rgb), 0.25);
         }
-        .table th, .table td {
-            vertical-align: middle;
+        .quota-exceeded {
+            border: 2px solid rgba(var(--bs-danger-rgb), 0.7);
+        }
+        .progress {
+            height: 1.5rem;
+            font-size: 0.8rem;
+            border-radius: 0.5rem;
+            background-color: #e9ecef;
         }
         .model-name {
             font-weight: 500;
         }
-        .unavailable-key {
-            opacity: 0.6;
-            border: 2px dashed #6c757d;
+        .chart-container {
+            height: 350px;
         }
-        .unavailable-badge {
-            font-size: 0.8rem;
+        @keyframes spin {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
         }
-       .quota-exceeded {
-           border: 2px solid #dc3545 !important;
-           box-shadow: 0 0 10px rgba(220, 53, 69, 0.25);
-       }
+
+        /* Dark Theme Overrides */
+        [data-bs-theme="dark"] body {
+            background-color: #121212;
+            color: #dee2e6;
+        }
+        [data-bs-theme="dark"] .card {
+            background-color: #1e1e1e;
+            border-color: rgba(255, 255, 255, 0.125);
+        }
+        [data-bs-theme="dark"] .card-header {
+            border-color: rgba(255, 255, 255, 0.125);
+        }
+        [data-bs-theme="dark"] .progress {
+             background-color: #444;
+        }
+        [data-bs-theme="dark"] .text-muted {
+            color: #adb5bd !important;
+        }
+        [data-bs-theme="dark"] .table {
+            --bs-table-color: #dee2e6;
+            --bs-table-bg: #1e1e1e;
+            --bs-table-border-color: rgba(255, 255, 255, 0.1);
+            --bs-table-striped-bg: #2c2c2c;
+            --bs-table-hover-bg: #323232;
+        }
     </style>
 </head>
 <body>
-    <div class="container mt-5">
-       <h1 class="mb-4 text-center">API Key Usage Status</h1>
-
-       <div class="card mb-4">
-           <div class="card-body text-center">
-               <h5 class="card-title">Total Tokens Consumed</h5>
-               <p class="card-text fs-4 fw-bold">{{ "{:,.0f}".format(grand_total_tokens) }}</p>
-           </div>
-       </div>
-
-        {% if current_masked_key and current_masked_key != "None" %}
-        <div class="alert alert-info text-center" role="alert">
-            <strong>Current Active Key:</strong> {{ current_masked_key }}
-        </div>
-        {% else %}
-        <div class="alert alert-warning text-center" role="alert">
-            <strong>No active key. All keys might be rate-limited.</strong>
-        </div>
-        {% endif %}
-
-        {% for key_type, keys in [('Priority Keys', priority_keys), ('Secondary Keys', secondary_keys)] %}
-        <h2 class="h4 mt-5">{{ key_type }}</h2>
-        {% if keys %}
-            {% for key in keys %}
-            {% set masked_key = key[:4] + '...' + key[-4:] %}
-            {% set key_status = key_usage_status.get(key) %}
-            <div class="card {% if masked_key == current_masked_key %}key-active{% endif %} {% if key_status and key_status.daily_quota_exceeded %}quota-exceeded{% endif %}">
-                <div class="card-header d-flex justify-content-between align-items-center">
-                    <strong>{{ masked_key }}</strong>
-                    {% if key_status and key_status.daily_quota_exceeded %}
-                        <span class="badge bg-danger">Daily Quota Exceeded</span>
-                    {% endif %}
-                </div>
-                <div class="card-body">
-                    <table class="table table-sm table-hover">
-                        <thead>
-                            <tr>
-                                <th scope="col">Model</th>
-                                <th scope="col" style="width: 40%;">Tokens (Last 60s)</th>
-                                <th scope="col">Total Tokens Used</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {% for model in model_order %}
-                            {% set usage = key_usage_status[key][model] %}
-                            {% set model_config = models_config.get(model, {}) %}
-                            {% set tpm_limit = model_config.get('tpm_limit', 1) %}
-                            {% set percentage = (usage.tokens_last_minute / tpm_limit) * 100 if tpm_limit > 0 else 0 %}
-                            <tr>
-                                <td class="model-name">{{ model }}</td>
-                                <td>
-                                    <div class="progress">
-                                        <div class="progress-bar {% if percentage > 90 %}bg-danger{% elif percentage > 70 %}bg-warning{% else %}bg-success{% endif %}" role="progressbar" style="width: {{ percentage }}%;" aria-valuenow="{{ usage.tokens_last_minute }}" aria-valuemin="0" aria-valuemax="{{ tpm_limit }}">
-                                            {{ usage.tokens_last_minute }} / {{ tpm_limit }}
-                                        </div>
-                                    </div>
-                                </td>
-                                <td>{{ usage.total_tokens }}</td>
-                            </tr>
-                            {% endfor %}
-                        </tbody>
-                    </table>
+    <div class="container-fluid mt-3">
+        <div class="row mb-4">
+            <div class="col-lg-6 mb-4 mb-lg-0">
+                <div class="card h-100">
+                    <div class="card-body text-center d-flex flex-column justify-content-center">
+                        <h5 class="card-title text-muted">Total Tokens Consumed</h5>
+                        <p class="card-text fs-2 fw-bolder text-primary" id="grand-total-tokens">0</p>
+                    </div>
                 </div>
             </div>
-            {% endfor %}
-        {% else %}
-            <p class="text-muted">No {{ key_type.lower() }} configured.</p>
-        {% endif %}
-        {% endfor %}
-
-        {% if unavailable_keys %}
-        <h2 class="h4 mt-5">Unavailable Keys</h2>
-        <div class="card unavailable-key">
-            <div class="card-body">
-                {% for key in unavailable_keys %}
-                    <span class="badge bg-danger unavailable-badge me-2">{{ key[:4] + '...' + key[-4:] }}</span>
-                {% endfor %}
+            <div class="col-lg-6">
+                <div class="card h-100">
+                    <div class="card-body text-center d-flex flex-column justify-content-center">
+                        <h5 class="card-title text-muted">Current Active Key</h5>
+                        <div id="current-active-key-container">
+                            <p class="card-text fs-4 fw-bold text-warning">Loading...</p>
+                        </div>
+                    </div>
+                </div>
             </div>
         </div>
-        {% endif %}
+        <div class="row">
+            <div class="col-lg-6 mb-4">
+                <div class="card h-100">
+                    <div class="card-header">
+                        <i class="bi bi-graph-up me-2"></i>Token Consumption by Model (Last Hour)
+                    </div>
+                    <div class="card-body">
+                        <div class="chart-container">
+                            <canvas id="model-token-chart"></canvas>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-lg-6 mb-4">
+                <div class="card h-100">
+                    <div class="card-header">
+                        <i class="bi bi-lightning-charge-fill me-2"></i>Active Key's Model Usage (Last Hour)
+                    </div>
+                    <div class="card-body">
+                        <div class="chart-container">
+                            <canvas id="active-key-model-chart"></canvas>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
 
-        <footer class="text-center text-muted mt-4 py-3">
-            <p>Page auto-refreshes every 10 seconds.</p>
+        <h3 class="h4 mt-4 mb-3">Priority Keys</h3>
+        <div id="priority-keys-container" class="row row-cols-1 row-cols-md-2 row-cols-xl-3 g-4">
+            
+        </div>
+
+        <h3 class="h4 mt-4 mb-3">Secondary Keys</h3>
+        <div id="secondary-keys-container" class="row row-cols-1 row-cols-md-2 row-cols-xl-3 g-4">
+            
+        </div>
+        
+        <h3 class="h4 mt-4 mb-3" style="display: none;">Unavailable Keys</h3>
+        <div class="row" style="display: none;">
+            <div class="col">
+                <div class="card">
+                    <div id="unavailable-keys-container" class="card-body d-flex flex-wrap gap-2">
+                        
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <h3 class="h4 mt-4 mb-3" style="display: none;">Rate Limited Keys</h3>
+        <div class="row" style="display: none;">
+            <div class="col">
+                <div class="card">
+                    <div id="rate-limited-keys-container" class="card-body d-flex flex-wrap gap-2">
+                        
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <h3 class="h4 mt-4 mb-3" style="display: none;">Quota Exhausted Keys</h3>
+        <div class="row" style="display: none;">
+            <div class="col">
+                <div class="card">
+                    <div id="quota-exhausted-keys-container" class="card-body d-flex flex-wrap gap-2">
+                        
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <footer class="text-center text-muted mt-5 py-3">
+            <p>Status automatically updates every 10 seconds.</p>
+            <p class="small">Last updated: <span id="last-update-time">Loading...</span></p>
         </footer>
     </div>
 
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script>
-        setTimeout(() => {
-            location.reload();
-        }, 10000);
+        const testResults = {};
+        function testKey(apiKey, modelName, buttonElement) {
+            const icon = buttonElement.querySelector('i');
+            const statusSpan = buttonElement.nextElementSibling;
+            const testId = `${apiKey}-${modelName}`;
+
+            // Disable button and show spinner
+            buttonElement.disabled = true;
+            icon.className = 'bi bi-arrow-repeat';
+            icon.style.animation = 'spin 1s linear infinite';
+            statusSpan.innerHTML = '';
+
+            fetch('/api/test_key', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ api_key: apiKey, model_name: modelName }),
+            })
+            .then(response => response.json())
+            .then(data => {
+                let resultHTML;
+                if (data.status_code === 200) {
+                    resultHTML = '<i class="bi bi-check-circle-fill text-success" title="OK"></i>';
+                } else if (data.status_code === 403) {
+                    resultHTML = '<i class="bi bi-x-circle-fill text-danger" title="Forbidden (Invalid Key)"></i>';
+                } else {
+                    resultHTML = `<i class="bi bi-exclamation-triangle-fill text-warning" title="Status: ${data.status_code}"></i>`;
+                }
+                statusSpan.innerHTML = resultHTML;
+                testResults[testId] = resultHTML;
+            })
+            .catch(error => {
+                console.error('Test request failed:', error);
+                const resultHTML = '<i class="bi bi-question-circle-fill text-muted" title="Test Failed"></i>';
+                statusSpan.innerHTML = resultHTML;
+                testResults[testId] = resultHTML;
+            })
+            .finally(() => {
+                // Re-enable button and restore icon
+                buttonElement.disabled = false;
+                icon.className = 'bi bi-play-circle';
+                icon.style.animation = '';
+            });
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            const chartOptions = {
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {
+                    x: { grid: { display: false } },
+                    y: {
+                        beginAtZero: true,
+                        grid: { color: 'rgba(0, 0, 0, 0.05)' }
+                    }
+                },
+                plugins: {
+                    legend: { position: 'top' },
+                    tooltip: { mode: 'index', intersect: false }
+                },
+                interaction: {
+                    mode: 'index',
+                    intersect: false
+                }
+            };
+
+            const modelTokenChartCtx = document.getElementById('model-token-chart').getContext('2d');
+            let modelTokenChart = new Chart(modelTokenChartCtx, { type: 'line', data: { labels: [], datasets: [] }, options: chartOptions });
+
+            const activeKeyModelChartCtx = document.getElementById('active-key-model-chart').getContext('2d');
+            let activeKeyModelChart = new Chart(activeKeyModelChartCtx, { type: 'line', data: { labels: [], datasets: [] }, options: chartOptions });
+
+            function setTheme(isDark) {
+                document.documentElement.setAttribute('data-bs-theme', isDark ? 'dark' : 'light');
+
+                const gridColor = isDark ? 'rgba(255, 255, 255, 0.1)' : 'rgba(0, 0, 0, 0.05)';
+                const textColor = isDark ? '#dee2e6' : '#495057';
+
+                const updateChartOptions = (chart) => {
+                    if (!chart) return;
+                    chart.options.scales.x.ticks.color = textColor;
+                    chart.options.scales.y.ticks.color = textColor;
+                    chart.options.scales.y.grid.color = gridColor;
+                    chart.options.plugins.legend.labels.color = textColor;
+                    chart.update('none');
+                };
+
+                updateChartOptions(modelTokenChart);
+                updateChartOptions(activeKeyModelChart);
+            }
+
+            const darkModeMatcher = window.matchMedia('(prefers-color-scheme: dark)');
+            darkModeMatcher.addEventListener('change', e => setTheme(e.matches));
+            setTheme(darkModeMatcher.matches); // Initial theme setup
+
+            async function fetchAndUpdateStatus() {
+                try {
+                    const response = await fetch('/api/status_data');
+                    if (!response.ok) {
+                        console.error(`HTTP error! status: ${response.status}`);
+                        return;
+                    }
+                    const data = await response.json();
+
+                    // Update last update time
+                    const now = new Date();
+                    document.getElementById('last-update-time').textContent = now.toLocaleTimeString();
+
+                    // 1. Update simple text fields
+                    document.getElementById('grand-total-tokens').textContent = data.grand_total_tokens.toLocaleString('en-US');
+                    
+                    const activeKeyContainer = document.getElementById('current-active-key-container');
+                    if (data.current_masked_key && data.current_masked_key !== "None") {
+                        activeKeyContainer.innerHTML = `<p class="card-text fs-3 fw-bolder">${data.current_masked_key}</p>`;
+                    } else {
+                        activeKeyContainer.innerHTML = `<p class="card-text fs-4 fw-bold text-warning">No active key</p>`;
+                    }
+
+                    // 2. Update Charts
+                    if (data.model_chart_data) {
+                        modelTokenChart.data.labels = data.model_chart_data.labels;
+                        modelTokenChart.data.datasets = data.model_chart_data.datasets;
+                        modelTokenChart.update('none');
+                    }
+                    if (data.active_key_model_chart_data) {
+                        activeKeyModelChart.data.labels = data.active_key_model_chart_data.labels;
+                        activeKeyModelChart.data.datasets = data.active_key_model_chart_data.datasets;
+                        activeKeyModelChart.update('none');
+                    }
+
+                    // 3. Update Key Cards by re-rendering them
+                    updateKeyCards(data);
+
+                    // 4. Update special key sections (rate limited, quota exhausted, unavailable)
+                    updateKeyBadgeSection('rate-limited-keys-container', data.rate_limited_keys, 'bg-warning-subtle text-warning-emphasis');
+                    updateKeyBadgeSection('quota-exhausted-keys-container', data.quota_exhausted_keys, 'bg-danger-subtle text-danger-emphasis');
+                    updateKeyBadgeSection('unavailable-keys-container', data.unavailable_keys, 'bg-dark-subtle text-dark-emphasis');
+
+                } catch (error) {
+                    console.error("Failed to fetch status:", error);
+                    document.getElementById('last-update-time').textContent = 'Error updating';
+                }
+            }
+
+            function updateKeyBadgeSection(containerId, keys, badgeClass) {
+                const container = document.getElementById(containerId);
+                if (!container) return;
+
+                const parentCard = container.closest('.card');
+                const parentRow = parentCard ? parentCard.closest('.row') : null;
+                const parentHeader = parentRow ? parentRow.previousElementSibling : null;
+
+                if (!keys || keys.length === 0) {
+                    if(parentRow) parentRow.style.display = 'none';
+                    if(parentHeader) parentHeader.style.display = 'none';
+                    return;
+                }
+                
+                if(parentRow) parentRow.style.display = '';
+                if(parentHeader) parentHeader.style.display = '';
+
+                let content = '';
+                keys.forEach(key => {
+                    const maskedKey = key.substring(0, 4) + '...' + key.substring(key.length - 4);
+                    content += `<span class="badge ${badgeClass} rounded-pill">${maskedKey}</span>`;
+                });
+                container.innerHTML = content;
+            }
+
+            function renderKeyCard(key, data) {
+                const maskedKey = key.substring(0, 4) + '...' + key.substring(key.length - 4);
+                const safeKeyId = key.substring(0, 4) + '---' + key.substring(key.length - 4);
+                const keyStatus = data.key_usage_status[key] || {};
+                const isActive = maskedKey === data.current_masked_key;
+                const isQuotaExceeded = keyStatus.daily_quota_exceeded || false;
+                const isDisabled = Object.values(keyStatus).some(model => model && typeof model === 'object' && model.is_temporarily_disabled);
+                const isQuotaExhausted = data.quota_exhausted_keys && data.quota_exhausted_keys.includes(key);
+                const isRateLimited = data.rate_limited_keys && data.rate_limited_keys.includes(key);
+
+                let cardClasses = 'card h-100';
+                if (isActive) cardClasses += ' key-active';
+                else if (isQuotaExceeded || isQuotaExhausted) cardClasses += ' quota-exceeded';
+
+                let badgeHTML = '';
+                if (isQuotaExhausted) {
+                    badgeHTML = `<span class="badge bg-danger-subtle text-danger-emphasis rounded-pill">Quota Exhausted</span>`;
+                } else if (isRateLimited) {
+                    badgeHTML = `<span class="badge bg-warning-subtle text-warning-emphasis rounded-pill">Rate Limited</span>`;
+                } else if (isDisabled) {
+                    badgeHTML = `<span class="badge bg-warning-subtle text-warning-emphasis rounded-pill">Temporarily Disabled</span>`;
+                } else if (!isActive && isQuotaExceeded) {
+                    badgeHTML = `<span class="badge bg-danger-subtle text-danger-emphasis rounded-pill">Daily Quota Exceeded</span>`;
+                }
+
+                let modelRowsHTML = '';
+                data.model_order.forEach(model => {
+                    const usage = keyStatus[model] || {};
+                    const modelConfig = data.models_config[model] || {};
+                    const tpmLimit = modelConfig.tpm_limit || 1;
+                    const tokensLastMinute = usage.tokens_last_minute || 0;
+                    const totalTokens = usage.total_tokens || 0;
+                    const percentage = Math.min((tokensLastMinute / tpmLimit) * 100, 100);
+
+                    let progressBarClass = 'progress-bar ';
+                    if (usage.is_temporarily_disabled) progressBarClass += 'bg-secondary';
+                    else if (percentage > 90) progressBarClass += 'bg-danger';
+                    else if (percentage > 70) progressBarClass += 'bg-warning';
+                    else progressBarClass += 'bg-success';
+                    
+                    let modelNameHTML = model;
+                    if (usage.is_temporarily_disabled) {
+                        modelNameHTML += ` <i class="bi bi-pause-circle text-warning" title="Temporarily Disabled"></i>`;
+                    }
+
+                    const testId = `${key}-${model}`;
+                    const testStatusHTML = testResults[testId] || '';
+
+                    modelRowsHTML += `
+                        <tr id="model-row-${safeKeyId}-${model}">
+                            <td class="model-name">${modelNameHTML}</td>
+                            <td>
+                                <div class="progress">
+                                    <div class="${progressBarClass}" role="progressbar" style="width: ${percentage}%;" aria-valuenow="${tokensLastMinute}" aria-valuemin="0" aria-valuemax="${tpmLimit}">
+                                        ${tokensLastMinute.toLocaleString()} / ${tpmLimit.toLocaleString()}
+                                    </div>
+                                </div>
+                            </td>
+                            <td class="total-tokens">${totalTokens.toLocaleString()}</td>
+                            <td>
+                               <button class="btn btn-sm btn-outline-secondary py-0 px-1" onclick="testKey('${key}', '${model}', this)">
+                                   <i class="bi bi-play-circle"></i>
+                               </button>
+                               <span class="test-status-icon ms-1">${testStatusHTML}</span>
+                           </td>
+                       </tr>
+                   `;
+                });
+
+                return `
+                    <div class="col" id="key-card-${safeKeyId}">
+                        <div class="${cardClasses}">
+                            <div class="card-header p-3 d-flex justify-content-between align-items-center">
+                                <span class="h6 mb-0"><i class="bi bi-key-fill me-2"></i>${maskedKey}</span>
+                                <span class="key-status-badge">${badgeHTML}</span>
+                            </div>
+                            <div class="card-body p-3">
+                                <table class="table table-sm table-hover mb-0">
+                                    <thead>
+                                        <tr>
+                                            <th scope="col">Model</th>
+                                            <th scope="col" style="width: 40%;">TPM (Last 60s)</th>
+                                            <th scope="col">Total Tokens</th>
+                                            <th scope="col">Test</th>
+                                       </tr>
+                                   </thead>
+                                    <tbody id="key-table-body-${safeKeyId}">${modelRowsHTML}</tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }
+
+            function updateKeyCards(data) {
+                const keySections = {
+                    'priority-keys-container': data.priority_keys,
+                    'secondary-keys-container': data.secondary_keys
+                };
+
+                for (const containerId in keySections) {
+                    const container = document.getElementById(containerId);
+                    const keys = keySections[containerId];
+                    if (!container) continue;
+
+                    if (!keys || keys.length === 0) {
+                        container.innerHTML = `
+                            <div class="col">
+                                <div class="card">
+                                    <div class="card-body text-center text-muted">
+                                        No ${containerId.includes('priority') ? 'priority' : 'secondary'} keys configured.
+                                    </div>
+                                </div>
+                            </div>`;
+                    } else {
+                        let content = '';
+                        keys.forEach(key => {
+                            content += renderKeyCard(key, data);
+                        });
+                        container.innerHTML = content;
+                    }
+                }
+            }
+            
+            // Initial call and set interval
+            fetchAndUpdateStatus();
+            setInterval(fetchAndUpdateStatus, 5000); // Update every 5 seconds
+        });
     </script>
 </body>
 </html>
