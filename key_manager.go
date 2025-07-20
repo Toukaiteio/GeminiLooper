@@ -320,10 +320,10 @@ func (km *KeyManager) GetKey(modelName string) (string, string, time.Duration, e
 
 		UpdateLanguageModelUsage(usage, now)
 
-		// New check for total usage limit of 4.1M tokens
-		if usage.TotalTokenUse >= 4100000 {
+		// Check for daily usage limit of 4.1M tokens
+		if usage.TodayUsage >= 4100000 {
 			usage.Exceeded = true
-			log.Printf("Key %s for model %s reached total usage limit of 4.1M tokens. Marked as 'exceeded'.", keyInfo.Key[:4], modelName)
+			log.Printf("Key %s for model %s reached daily usage limit of 4.1M tokens. Marked as 'exceeded'.", keyInfo.Key[:4], modelName)
 			continue
 		}
 
@@ -414,10 +414,10 @@ func (km *KeyManager) HandleRateLimitError(modelName, key string) {
 
 	UpdateLanguageModelUsage(usage, time.Now().Unix())
 
-	// If usage is over 4.1M tokens, a 429 error means the quota is likely exhausted.
-	if usage.TotalTokenUse >= 4100000 {
+	// If daily usage is over 4.1M tokens, a 429 error means the quota is likely exhausted.
+	if usage.TodayUsage >= 4100000 {
 		usage.Exceeded = true
-		log.Printf("Rate limit hit for model %s with key %s and total usage is over 4.1M. Marked as 'exceeded'.", modelName, key[:4])
+		log.Printf("Rate limit hit for model %s with key %s and daily usage is over 4.1M. Marked as 'exceeded'.", modelName, key[:4])
 		return
 	}
 

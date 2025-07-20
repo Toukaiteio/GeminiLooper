@@ -21,6 +21,17 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+func setupLogging() {
+	logFile, err := os.OpenFile("geminilooper.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
+	if err != nil {
+		log.Fatalf("Failed to open log file: %v", err)
+	}
+	// Create a multi-writer to write to both file and stdout
+	multiWriter := io.MultiWriter(os.Stdout, logFile)
+	log.SetOutput(multiWriter)
+	log.Println("Logging setup complete. Logs will be written to stdout and geminilooper.log")
+}
+
 type GeminiResponse struct {
 	Candidates []struct {
 		// ... other fields
@@ -68,6 +79,7 @@ type OllamaStreamResponse struct {
 }
 
 func main() {
+	setupLogging()
 	keyManager, err := NewKeyManager()
 	if err != nil {
 		log.Fatalf("Failed to create key manager: %v", err)
