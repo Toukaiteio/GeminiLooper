@@ -95,6 +95,7 @@
                     <div class="card-body text-center d-flex flex-column justify-content-center">
                         <h5 class="card-title text-muted">Total Tokens Consumed</h5>
                         <p class="card-text fs-2 fw-bolder text-primary" id="grand-total-tokens">0</p>
+                        <p class="card-text text-muted small" id="grand-total-today-usage">(Today: 0)</p>
                     </div>
                 </div>
             </div>
@@ -212,6 +213,12 @@
                 let resultHTML;
                 if (data.status_code === 200) {
                     resultHTML = '<i class="bi bi-check-circle-fill text-success" title="OK"></i>';
+                    // If the test is successful, re-enable the model
+                    fetch('/api/enable_model', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ api_key: apiKey, model_name: modelName })
+                    });
                 } else if (data.status_code === 403) {
                     resultHTML = '<i class="bi bi-x-circle-fill text-danger" title="Forbidden (Invalid Key)"></i>';
                 } else {
@@ -299,7 +306,8 @@
 
                     // 1. Update simple text fields
                     document.getElementById('grand-total-tokens').textContent = data.grand_total_tokens.toLocaleString('en-US');
-                    
+                    document.getElementById('grand-total-today-usage').textContent = `(Today: ${data.grand_total_today_usage.toLocaleString('en-US')})`;
+
                     const activeKeyContainer = document.getElementById('current-active-key-container');
                     if (data.current_masked_key && data.current_masked_key !== "None") {
                         activeKeyContainer.innerHTML = `<p class="card-text fs-3 fw-bolder">${data.current_masked_key}</p>`;
@@ -390,6 +398,7 @@
                     const tpmLimit = modelConfig.tpm_limit || 1;
                     const tokensLastMinute = usage.tokens_last_minute || 0;
                     const totalTokens = usage.total_tokens || 0;
+                    const todayUsage = usage.today_usage || 0;
                     const percentage = Math.min((tokensLastMinute / tpmLimit) * 100, 100);
 
                     let progressBarClass = 'progress-bar ';
@@ -416,7 +425,7 @@
                                     </div>
                                 </div>
                             </td>
-                            <td class="total-tokens">${totalTokens.toLocaleString()}</td>
+                            <td class="total-tokens">${totalTokens.toLocaleString()} <span class="text-muted" style="font-size: 0.8em;">(${todayUsage.toLocaleString()})</span></td>
                             <td>
                                <button class="btn btn-sm btn-outline-secondary py-0 px-1" onclick="testKey('${key}', '${model}', this)">
                                    <i class="bi bi-play-circle"></i>
@@ -440,7 +449,7 @@
                                         <tr>
                                             <th scope="col">Model</th>
                                             <th scope="col" style="width: 40%;">TPM (Last 60s)</th>
-                                            <th scope="col">Total Tokens</th>
+                                            <th scope="col">Total (Today)</th>
                                             <th scope="col">Test</th>
                                        </tr>
                                    </thead>

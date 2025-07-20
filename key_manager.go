@@ -35,10 +35,12 @@ type UsageData struct {
 type LanguageModelUsage struct {
 	LanguageModel
 	TotalTokenUse         int         `json:"total_tokens"`
+	TodayUsage            int         `json:"today_usage,omitempty"`
 	Past24HoursTokenUsage []UsageData `json:"past_24hrs_usage_data"`
 	ProbablyExceeded      bool        `json:"probably_exceeded"`
 	Exceeded              bool        `json:"exceeded"`
 	// Fields calculated at runtime
+	JustHit429        bool        `json:"-"`
 	Past60sTokenUsage []UsageData `json:"-"`
 }
 
@@ -67,6 +69,7 @@ type KeyManager struct {
 // Status page data structures
 type StatusData struct {
 	GrandTotalTokens        int                    `json:"grand_total_tokens"`
+	GrandTotalTodayUsage    int                    `json:"grand_total_today_usage"`
 	CurrentMaskedKey        string                 `json:"current_masked_key"`
 	CurrentRawKey           string                 `json:"-"` // Internal use, not marshalled
 	KeyUsageStatus          map[string]KeyStatus   `json:"key_usage_status"`
@@ -87,6 +90,7 @@ type KeyStatus map[string]ModelUsageStatus // key: modelName
 type ModelUsageStatus struct {
 	TokensLastMinute      int  `json:"tokens_last_minute"`
 	TotalTokens           int  `json:"total_tokens"`
+	TodayUsage            int  `json:"today_usage"`
 	IsTemporarilyDisabled bool `json:"is_temporarily_disabled"`
 	DailyQuotaExceeded    bool `json:"daily_quota_exceeded"`
 }
@@ -280,12 +284,14 @@ func (km *KeyManager) resetQuotas() {
 	defer km.mutex.Unlock()
 
 	for _, usage := range km.usage {
-		usage.TotalTokenUse = 0
+		// usage.TotalTokenUse is a lifetime cumulative value.
+		// We only reset the daily counters.
+		usage.TodayUsage = 0
 		usage.Past24HoursTokenUsage = []UsageData{}
 		usage.Exceeded = false
 		usage.ProbablyExceeded = false
 	}
-	log.Println("All quotas have been reset.")
+	log.Println("All daily quotas have been reset.")
 }
 
 func (km *KeyManager) GetKey(modelName string) (string, string, time.Duration, error) {
@@ -313,6 +319,13 @@ func (km *KeyManager) GetKey(modelName string) (string, string, time.Duration, e
 		}
 
 		UpdateLanguageModelUsage(usage, now)
+
+		// New check for total usage limit of 4.1M tokens
+		if usage.TotalTokenUse >= 4100000 {
+			usage.Exceeded = true
+			log.Printf("Key %s for model %s reached total usage limit of 4.1M tokens. Marked as 'exceeded'.", keyInfo.Key[:4], modelName)
+			continue
+		}
 
 		// Check TPD limit
 		if model.TpdLimit != nil && *model.TpdLimit > 0 {
@@ -383,7 +396,9 @@ func (km *KeyManager) RecordUsage(modelName, key string, tokenCount int) {
 	}
 
 	usage.TotalTokenUse += tokenCount
+	usage.TodayUsage += tokenCount
 	usage.Past24HoursTokenUsage = append(usage.Past24HoursTokenUsage, newData)
+	usage.JustHit429 = false // A successful request resets the flag
 	UpdateLanguageModelUsage(usage, now)
 }
 
@@ -397,24 +412,46 @@ func (km *KeyManager) HandleRateLimitError(modelName, key string) {
 		return
 	}
 
-	now := time.Now().Unix()
-	UpdateLanguageModelUsage(usage, now)
+	UpdateLanguageModelUsage(usage, time.Now().Unix())
 
-	var past60sTokens int
-	for _, data := range usage.Past60sTokenUsage {
-		past60sTokens += data.CostToken
+	// If usage is over 4.1M tokens, a 429 error means the quota is likely exhausted.
+	if usage.TotalTokenUse >= 4100000 {
+		usage.Exceeded = true
+		log.Printf("Rate limit hit for model %s with key %s and total usage is over 4.1M. Marked as 'exceeded'.", modelName, key[:4])
+		return
 	}
 
-	model := km.config.Models[modelName]
-	if past60sTokens >= model.TpmLimit {
-		// TPM limit exceeded, just wait, no need to mark as probably exceeded
-		log.Printf("TPM limit likely hit for model %s with key %s. Waiting...", modelName, key[:4])
-	} else {
-		// Other limit (e.g., RPM), mark as probably exceeded
+	// This is the core of the new logic.
+	if usage.JustHit429 {
+		// This is the second consecutive 429 error after a delay. The delay mechanism failed.
+		// Disable the model for this key temporarily.
 		usage.ProbablyExceeded = true
-		log.Printf("Rate limit hit for model %s with key %s. Marked as 'probably exceeded'.", modelName, key[:4])
+		usage.JustHit429 = false // Reset the flag
+		log.Printf("Consecutive rate limit hit for model %s with key %s after delay. Marked as 'probably exceeded'.", modelName, key[:4])
+	} else {
+		// This is the first 429 error in a sequence. Set the flag.
+		// The proxy handler will now call GetKey, which will enforce a delay.
+		usage.JustHit429 = true
+		log.Printf("Rate limit hit for model %s with key %s. Delay mechanism will be used. If the next attempt also fails, the model will be disabled.", modelName, key[:4])
+	}
+}
+
+func (km *KeyManager) EnableModel(modelName, key string) {
+	km.mutex.Lock()
+	defer km.mutex.Unlock()
+
+	usageKey := modelName + "_" + key
+	usage, ok := km.usage[usageKey]
+	if !ok {
+		log.Printf("EnableModel: Usage key '%s' not found", usageKey)
+		return
 	}
 
+	if usage.ProbablyExceeded {
+		usage.ProbablyExceeded = false
+		usage.JustHit429 = false // Also reset the flag
+		log.Printf("Model %s for key %s has been re-enabled.", modelName, key[:4])
+	}
 }
 
 func LoadConfig() (*KeyManagerConfig, error) {
@@ -510,12 +547,14 @@ func LoadKeyUsage(config *KeyManagerConfig) (map[string]*LanguageModelUsage, err
 			for usageKey, usage := range newUsage {
 				if oldData, ok := oldUsage[usageKey]; ok {
 					usage.TotalTokenUse = oldData.TotalTokenUse
+					usage.TodayUsage = oldData.TodayUsage
 					// Make sure Past24HoursTokenUsage is not nil
 					if oldData.Past24HoursTokenUsage != nil {
 						usage.Past24HoursTokenUsage = oldData.Past24HoursTokenUsage
 					}
 					usage.ProbablyExceeded = oldData.ProbablyExceeded
 					usage.Exceeded = oldData.Exceeded
+					// JustHit429 is a runtime-only field, so no need to load it.
 				}
 			}
 		} else {
@@ -583,6 +622,7 @@ func (km *KeyManager) GetStatus() *StatusData {
 
 	now := time.Now().Unix()
 	grandTotalTokens := 0
+	grandTotalTodayUsage := 0
 	keyUsageStatus := make(map[string]KeyStatus)
 	rateLimitedKeys := make(map[string]bool)
 	quotaExhaustedKeys := make(map[string]bool)
@@ -608,6 +648,7 @@ func (km *KeyManager) GetStatus() *StatusData {
 
 			UpdateLanguageModelUsage(usage, now)
 			grandTotalTokens += usage.TotalTokenUse
+			grandTotalTodayUsage += usage.TodayUsage
 
 			var tokensLastMinute int
 			for _, data := range usage.Past60sTokenUsage {
@@ -617,6 +658,7 @@ func (km *KeyManager) GetStatus() *StatusData {
 			keyStatus[modelName] = ModelUsageStatus{
 				TokensLastMinute:      tokensLastMinute,
 				TotalTokens:           usage.TotalTokenUse,
+				TodayUsage:            usage.TodayUsage,
 				IsTemporarilyDisabled: usage.ProbablyExceeded,
 				DailyQuotaExceeded:    usage.Exceeded,
 			}
@@ -676,6 +718,7 @@ func (km *KeyManager) GetStatus() *StatusData {
 
 	return &StatusData{
 		GrandTotalTokens:        grandTotalTokens,
+		GrandTotalTodayUsage:    grandTotalTodayUsage,
 		CurrentMaskedKey:        currentMaskedKey,
 		CurrentRawKey:           currentRawKey,
 		KeyUsageStatus:          keyUsageStatus,
