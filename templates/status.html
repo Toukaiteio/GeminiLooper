@@ -139,12 +139,10 @@
 
         <h3 class="h4 mt-4 mb-3">Priority Keys</h3>
         <div id="priority-keys-container" class="row row-cols-1 row-cols-md-2 row-cols-xl-3 g-4">
-            
         </div>
 
         <h3 class="h4 mt-4 mb-3">Secondary Keys</h3>
         <div id="secondary-keys-container" class="row row-cols-1 row-cols-md-2 row-cols-xl-3 g-4">
-            
         </div>
         
         <h3 class="h4 mt-4 mb-3" style="display: none;">Unavailable Keys</h3>
@@ -152,7 +150,6 @@
             <div class="col">
                 <div class="card">
                     <div id="unavailable-keys-container" class="card-body d-flex flex-wrap gap-2">
-                        
                     </div>
                 </div>
             </div>
@@ -163,7 +160,6 @@
             <div class="col">
                 <div class="card">
                     <div id="rate-limited-keys-container" class="card-body d-flex flex-wrap gap-2">
-                        
                     </div>
                 </div>
             </div>
@@ -174,14 +170,23 @@
             <div class="col">
                 <div class="card">
                     <div id="quota-exhausted-keys-container" class="card-body d-flex flex-wrap gap-2">
-                        
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <h3 class="h4 mt-4 mb-3" style="display: none;">Permanently Banned Keys</h3>
+        <div class="row" style="display: none;">
+            <div class="col">
+                <div class="card">
+                    <div id="permanently-banned-keys-container" class="card-body d-flex flex-wrap gap-2">
                     </div>
                 </div>
             </div>
         </div>
 
         <footer class="text-center text-muted mt-5 py-3">
-            <p>Status automatically updates every 10 seconds.</p>
+            <p>Status automatically updates every 5 seconds.</p>
             <p class="small">Last updated: <span id="last-update-time">Loading...</span></p>
         </footer>
     </div>
@@ -190,12 +195,40 @@
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script>
         const testResults = {};
+        const usageToggleState = {}; // Store the state of the toggle switches
+
+        function sanitizeForQuerySelector(id) {
+            // CSS.escape() is the modern way, but this is a simple fallback for wider compatibility.
+            return id.replace(/([ #;&,.+*~':"!^$\[\]()=>|/@])/g, '\\$1');
+        }
+
+        function toggleUsageView(checkbox, safeKeyId) {
+            usageToggleState[safeKeyId] = checkbox.checked;
+            const cardElement = document.getElementById(`key-card-${safeKeyId}`);
+            if (!cardElement) return;
+
+            const usageCells = cardElement.querySelectorAll('.usage-cell');
+            const headerCell = cardElement.querySelector('th[scope="col"]:nth-child(3)');
+
+            usageCells.forEach(cell => {
+                const usageValueSpan = cell.querySelector('.usage-value');
+                if (checkbox.checked) {
+                    // Show Today's Usage
+                    usageValueSpan.innerHTML = cell.dataset.today;
+                    if (headerCell) headerCell.textContent = 'Today';
+                } else {
+                    // Show Total Usage (Default)
+                    usageValueSpan.innerHTML = cell.dataset.total;
+                    if (headerCell) headerCell.textContent = 'Total';
+                }
+            });
+        }
+
         function testKey(apiKey, modelName, buttonElement) {
             const icon = buttonElement.querySelector('i');
             const statusSpan = buttonElement.nextElementSibling;
             const testId = `${apiKey}-${modelName}`;
 
-            // Disable button and show spinner
             buttonElement.disabled = true;
             icon.className = 'bi bi-arrow-repeat';
             icon.style.animation = 'spin 1s linear infinite';
@@ -203,9 +236,7 @@
 
             fetch('/api/test_key', {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
+                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ api_key: apiKey, model_name: modelName }),
             })
             .then(response => response.json())
@@ -213,7 +244,6 @@
                 let resultHTML;
                 if (data.status_code === 200) {
                     resultHTML = '<i class="bi bi-check-circle-fill text-success" title="OK"></i>';
-                    // If the test is successful, re-enable the model
                     fetch('/api/enable_model', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
@@ -234,7 +264,6 @@
                 testResults[testId] = resultHTML;
             })
             .finally(() => {
-                // Re-enable button and restore icon
                 buttonElement.disabled = false;
                 icon.className = 'bi bi-play-circle';
                 icon.style.animation = '';
@@ -247,49 +276,35 @@
                 maintainAspectRatio: false,
                 scales: {
                     x: { grid: { display: false } },
-                    y: {
-                        beginAtZero: true,
-                        grid: { color: 'rgba(0, 0, 0, 0.05)' }
-                    }
+                    y: { beginAtZero: true, grid: { color: 'rgba(0, 0, 0, 0.05)' } }
                 },
                 plugins: {
                     legend: { position: 'top' },
                     tooltip: { mode: 'index', intersect: false }
                 },
-                interaction: {
-                    mode: 'index',
-                    intersect: false
-                }
+                interaction: { mode: 'index', intersect: false }
             };
 
-            const modelTokenChartCtx = document.getElementById('model-token-chart').getContext('2d');
-            let modelTokenChart = new Chart(modelTokenChartCtx, { type: 'line', data: { labels: [], datasets: [] }, options: chartOptions });
-
-            const activeKeyModelChartCtx = document.getElementById('active-key-model-chart').getContext('2d');
-            let activeKeyModelChart = new Chart(activeKeyModelChartCtx, { type: 'line', data: { labels: [], datasets: [] }, options: chartOptions });
+            const modelTokenChart = new Chart(document.getElementById('model-token-chart').getContext('2d'), { type: 'line', data: { labels: [], datasets: [] }, options: chartOptions });
+            const activeKeyModelChart = new Chart(document.getElementById('active-key-model-chart').getContext('2d'), { type: 'line', data: { labels: [], datasets: [] }, options: chartOptions });
 
             function setTheme(isDark) {
                 document.documentElement.setAttribute('data-bs-theme', isDark ? 'dark' : 'light');
-
                 const gridColor = isDark ? 'rgba(255, 255, 255, 0.1)' : 'rgba(0, 0, 0, 0.05)';
                 const textColor = isDark ? '#dee2e6' : '#495057';
-
-                const updateChartOptions = (chart) => {
+                [modelTokenChart, activeKeyModelChart].forEach(chart => {
                     if (!chart) return;
                     chart.options.scales.x.ticks.color = textColor;
                     chart.options.scales.y.ticks.color = textColor;
                     chart.options.scales.y.grid.color = gridColor;
                     chart.options.plugins.legend.labels.color = textColor;
                     chart.update('none');
-                };
-
-                updateChartOptions(modelTokenChart);
-                updateChartOptions(activeKeyModelChart);
+                });
             }
 
             const darkModeMatcher = window.matchMedia('(prefers-color-scheme: dark)');
             darkModeMatcher.addEventListener('change', e => setTheme(e.matches));
-            setTheme(darkModeMatcher.matches); // Initial theme setup
+            setTheme(darkModeMatcher.matches);
 
             async function fetchAndUpdateStatus() {
                 try {
@@ -300,11 +315,7 @@
                     }
                     const data = await response.json();
 
-                    // Update last update time
-                    const now = new Date();
-                    document.getElementById('last-update-time').textContent = now.toLocaleTimeString();
-
-                    // 1. Update simple text fields
+                    document.getElementById('last-update-time').textContent = new Date().toLocaleTimeString();
                     document.getElementById('grand-total-tokens').textContent = data.grand_total_tokens.toLocaleString('en-US');
                     document.getElementById('grand-total-today-usage').textContent = `(Today: ${data.grand_total_today_usage.toLocaleString('en-US')})`;
 
@@ -315,7 +326,6 @@
                         activeKeyContainer.innerHTML = `<p class="card-text fs-4 fw-bold text-warning">No active key</p>`;
                     }
 
-                    // 2. Update Charts
                     if (data.model_chart_data) {
                         modelTokenChart.data.labels = data.model_chart_data.labels;
                         modelTokenChart.data.datasets = data.model_chart_data.datasets;
@@ -327,13 +337,11 @@
                         activeKeyModelChart.update('none');
                     }
 
-                    // 3. Update Key Cards by re-rendering them
                     updateKeyCards(data);
-
-                    // 4. Update special key sections (rate limited, quota exhausted, unavailable)
                     updateKeyBadgeSection('rate-limited-keys-container', data.rate_limited_keys, 'bg-warning-subtle text-warning-emphasis');
                     updateKeyBadgeSection('quota-exhausted-keys-container', data.quota_exhausted_keys, 'bg-danger-subtle text-danger-emphasis');
                     updateKeyBadgeSection('unavailable-keys-container', data.unavailable_keys, 'bg-dark-subtle text-dark-emphasis');
+                    updateKeyBadgeSection('permanently-banned-keys-container', data.permanently_banned_keys, 'bg-dark text-white', true);
 
                 } catch (error) {
                     console.error("Failed to fetch status:", error);
@@ -341,29 +349,140 @@
                 }
             }
 
-            function updateKeyBadgeSection(containerId, keys, badgeClass) {
+            function updateKeyBadgeSection(containerId, keys, badgeClass, showFullKey = false) {
                 const container = document.getElementById(containerId);
                 if (!container) return;
-
-                const parentCard = container.closest('.card');
-                const parentRow = parentCard ? parentCard.closest('.row') : null;
+                const parentRow = container.closest('.row');
                 const parentHeader = parentRow ? parentRow.previousElementSibling : null;
 
                 if (!keys || keys.length === 0) {
-                    if(parentRow) parentRow.style.display = 'none';
-                    if(parentHeader) parentHeader.style.display = 'none';
+                    if (parentRow) parentRow.style.display = 'none';
+                    if (parentHeader) parentHeader.style.display = 'none';
                     return;
                 }
                 
-                if(parentRow) parentRow.style.display = '';
-                if(parentHeader) parentHeader.style.display = '';
+                if (parentRow) parentRow.style.display = '';
+                if (parentHeader) parentHeader.style.display = '';
 
-                let content = '';
-                keys.forEach(key => {
-                    const maskedKey = key.substring(0, 4) + '...' + key.substring(key.length - 4);
-                    content += `<span class="badge ${badgeClass} rounded-pill">${maskedKey}</span>`;
+                container.innerHTML = keys.map(key => {
+                    const displayKey = showFullKey ? key : (key.substring(0, 4) + '...' + key.substring(key.length - 4));
+                    return `<span class="badge ${badgeClass} rounded-pill">${displayKey}</span>`;
+                }).join('');
+            }
+
+            function updateKeyCards(data) {
+                const keySections = {
+                    'priority-keys-container': data.priority_keys,
+                    'secondary-keys-container': data.secondary_keys
+                };
+
+                const allKeysInUIData = new Set([...(data.priority_keys || []), ...(data.secondary_keys || [])]);
+                const allSafeKeyIdsInUIData = new Set(Array.from(allKeysInUIData).map(k => k.substring(0, 4) + '---' + k.substring(k.length - 4)));
+
+                for (const containerId in keySections) {
+                    const container = document.getElementById(containerId);
+                    const keys = keySections[containerId] || [];
+                    
+                    if (!container) continue;
+                    
+                    // Add/Update cards
+                    keys.forEach(key => {
+                        const safeKeyId = key.substring(0, 4) + '---' + key.substring(key.length - 4);
+                        let cardWrapper = document.getElementById(`key-card-col-${safeKeyId}`);
+                        if (cardWrapper) {
+                            // Card exists, update it in place
+                            updateCardInPlace(cardWrapper.firstElementChild, key, data);
+                        } else {
+                            // Card doesn't exist, create and append it
+                            cardWrapper = document.createElement('div');
+                            cardWrapper.className = 'col';
+                            cardWrapper.id = `key-card-col-${safeKeyId}`;
+                            cardWrapper.innerHTML = renderKeyCard(key, data);
+                            container.appendChild(cardWrapper);
+                            // After creating, immediately apply the correct view state
+                            const toggle = document.getElementById(`usage-toggle-${safeKeyId}`);
+                            if(toggle) {
+                                toggle.checked = usageToggleState[safeKeyId] || false; // Default to unchecked
+                                toggleUsageView(toggle, safeKeyId);
+                            }
+                        }
+                    });
+                }
+                
+                // Remove old cards that are no longer in the data
+                document.querySelectorAll('[id^="key-card-col-"]').forEach(cardWrapper => {
+                    const safeKeyId = cardWrapper.id.replace('key-card-col-', '');
+                    if (!allSafeKeyIdsInUIData.has(safeKeyId)) {
+                        cardWrapper.remove();
+                    }
                 });
-                container.innerHTML = content;
+            }
+
+            function updateCardInPlace(cardElement, key, data) {
+                const safeKeyId = key.substring(0, 4) + '---' + key.substring(key.length - 4);
+                const keyStatus = data.key_usage_status[key] || {};
+                
+                const badge = cardElement.querySelector('.key-status-badge');
+                if(badge) badge.innerHTML = getBadgeHTML(key, data);
+
+                data.model_order.forEach(model => {
+                    const sanitizedModelName = sanitizeForQuerySelector(model);
+                    const row = cardElement.querySelector(`#model-row-${safeKeyId}-${sanitizedModelName}`);
+                    if (!row) return;
+
+                    const usage = keyStatus[model] || {};
+                    const modelConfig = data.models_config[model] || {};
+                    const tpmLimit = modelConfig.tpm_limit || 1;
+                    const tokensLastMinute = usage.tokens_last_minute || 0;
+                    const totalTokens = usage.total_tokens || 0;
+                    const todayUsage = usage.today_usage || 0;
+                    const percentage = Math.min((tokensLastMinute / tpmLimit) * 100, 100);
+
+                    const progressBar = row.querySelector('.progress-bar');
+                    if (progressBar) {
+                        let progressBarClass = 'progress-bar ';
+                        if (usage.is_temporarily_disabled) progressBarClass += 'bg-secondary';
+                        else if (percentage > 90) progressBarClass += 'bg-danger';
+                        else if (percentage > 70) progressBarClass += 'bg-warning';
+                        else progressBarClass += 'bg-success';
+                        progressBar.className = progressBarClass;
+                        progressBar.style.width = `${percentage}%`;
+                        progressBar.textContent = `${tokensLastMinute.toLocaleString()} / ${tpmLimit.toLocaleString()}`;
+                    }
+                    
+                    const usageCell = row.querySelector('.usage-cell');
+                    if(usageCell) {
+                        usageCell.dataset.total = totalTokens.toLocaleString();
+                        usageCell.dataset.today = todayUsage.toLocaleString();
+                    }
+
+                    const testStatusIcon = row.querySelector('.test-status-icon');
+                    if(testStatusIcon) {
+                        const testId = `${key}-${model}`;
+                        testStatusIcon.innerHTML = testResults[testId] || '';
+                    }
+                });
+
+                const toggle = document.getElementById(`usage-toggle-${safeKeyId}`);
+                if (toggle) {
+                    toggle.checked = usageToggleState[safeKeyId] || false;
+                    toggleUsageView(toggle, safeKeyId);
+                }
+            }
+            
+            function getBadgeHTML(key, data) {
+                const keyStatus = data.key_usage_status[key] || {};
+                const isActive = (key.substring(0, 4) + '...' + key.substring(key.length - 4)) === data.current_masked_key;
+                const isQuotaExceeded = keyStatus.daily_quota_exceeded || false;
+                const isDisabled = Object.values(keyStatus).some(model => model && typeof model === 'object' && model.is_temporarily_disabled);
+                const isQuotaExhausted = data.quota_exhausted_keys && data.quota_exhausted_keys.includes(key);
+                const isRateLimited = data.rate_limited_keys && data.rate_limited_keys.includes(key);
+
+                if (isQuotaExhausted) return `<span class="badge bg-danger-subtle text-danger-emphasis rounded-pill">Quota Exhausted</span>`;
+                if (isRateLimited) return `<span class="badge bg-warning-subtle text-warning-emphasis rounded-pill">Rate Limited</span>`;
+                if (isDisabled) return `<span class="badge bg-warning-subtle text-warning-emphasis rounded-pill">Temporarily Disabled</span>`;
+                if (!isActive && isQuotaExceeded) return `<span class="badge bg-danger-subtle text-danger-emphasis rounded-pill">Daily Quota Exceeded</span>`;
+                return '';
             }
 
             function renderKeyCard(key, data) {
@@ -371,25 +490,12 @@
                 const safeKeyId = key.substring(0, 4) + '---' + key.substring(key.length - 4);
                 const keyStatus = data.key_usage_status[key] || {};
                 const isActive = maskedKey === data.current_masked_key;
-                const isQuotaExceeded = keyStatus.daily_quota_exceeded || false;
-                const isDisabled = Object.values(keyStatus).some(model => model && typeof model === 'object' && model.is_temporarily_disabled);
                 const isQuotaExhausted = data.quota_exhausted_keys && data.quota_exhausted_keys.includes(key);
-                const isRateLimited = data.rate_limited_keys && data.rate_limited_keys.includes(key);
-
                 let cardClasses = 'card h-100';
                 if (isActive) cardClasses += ' key-active';
-                else if (isQuotaExceeded || isQuotaExhausted) cardClasses += ' quota-exceeded';
+                else if (isQuotaExhausted) cardClasses += ' quota-exceeded';
 
-                let badgeHTML = '';
-                if (isQuotaExhausted) {
-                    badgeHTML = `<span class="badge bg-danger-subtle text-danger-emphasis rounded-pill">Quota Exhausted</span>`;
-                } else if (isRateLimited) {
-                    badgeHTML = `<span class="badge bg-warning-subtle text-warning-emphasis rounded-pill">Rate Limited</span>`;
-                } else if (isDisabled) {
-                    badgeHTML = `<span class="badge bg-warning-subtle text-warning-emphasis rounded-pill">Temporarily Disabled</span>`;
-                } else if (!isActive && isQuotaExceeded) {
-                    badgeHTML = `<span class="badge bg-danger-subtle text-danger-emphasis rounded-pill">Daily Quota Exceeded</span>`;
-                }
+                const badgeHTML = getBadgeHTML(key, data);
 
                 let modelRowsHTML = '';
                 data.model_order.forEach(model => {
@@ -400,7 +506,6 @@
                     const totalTokens = usage.total_tokens || 0;
                     const todayUsage = usage.today_usage || 0;
                     const percentage = Math.min((tokensLastMinute / tpmLimit) * 100, 100);
-
                     let progressBarClass = 'progress-bar ';
                     if (usage.is_temporarily_disabled) progressBarClass += 'bg-secondary';
                     else if (percentage > 90) progressBarClass += 'bg-danger';
@@ -411,12 +516,12 @@
                     if (usage.is_temporarily_disabled) {
                         modelNameHTML += ` <i class="bi bi-pause-circle text-warning" title="Temporarily Disabled"></i>`;
                     }
-
                     const testId = `${key}-${model}`;
                     const testStatusHTML = testResults[testId] || '';
+                    const sanitizedModelName = sanitizeForQuerySelector(model);
 
                     modelRowsHTML += `
-                        <tr id="model-row-${safeKeyId}-${model}">
+                        <tr id="model-row-${safeKeyId}-${sanitizedModelName}">
                             <td class="model-name">${modelNameHTML}</td>
                             <td>
                                 <div class="progress">
@@ -425,7 +530,9 @@
                                     </div>
                                 </div>
                             </td>
-                            <td class="total-tokens">${totalTokens.toLocaleString()} <span class="text-muted" style="font-size: 0.8em;">(${todayUsage.toLocaleString()})</span></td>
+                            <td class="usage-cell" data-total="${totalTokens.toLocaleString()}" data-today="${todayUsage.toLocaleString()}">
+                                <span class="usage-value">${totalTokens.toLocaleString()}</span>
+                            </td>
                             <td>
                                <button class="btn btn-sm btn-outline-secondary py-0 px-1" onclick="testKey('${key}', '${model}', this)">
                                    <i class="bi bi-play-circle"></i>
@@ -437,63 +544,36 @@
                 });
 
                 return `
-                    <div class="col" id="key-card-${safeKeyId}">
-                        <div class="${cardClasses}">
-                            <div class="card-header p-3 d-flex justify-content-between align-items-center">
-                                <span class="h6 mb-0"><i class="bi bi-key-fill me-2"></i>${maskedKey}</span>
-                                <span class="key-status-badge">${badgeHTML}</span>
+                    <div class="card h-100" id="key-card-${safeKeyId}">
+                        <div class="card-header p-3 d-flex justify-content-between align-items-center">
+                            <span class="h6 mb-0"><i class="bi bi-key-fill me-2"></i>${maskedKey}</span>
+                            <div>
+                               <div class="form-check form-switch form-check-inline">
+                                   <input class="form-check-input" type="checkbox" role="switch" id="usage-toggle-${safeKeyId}" onchange="toggleUsageView(this, '${safeKeyId}')">
+                                   <label class="form-check-label small" for="usage-toggle-${safeKeyId}">Show Today</label>
+                               </div>
+                               <span class="key-status-badge">${badgeHTML}</span>
                             </div>
-                            <div class="card-body p-3">
-                                <table class="table table-sm table-hover mb-0">
-                                    <thead>
-                                        <tr>
-                                            <th scope="col">Model</th>
-                                            <th scope="col" style="width: 40%;">TPM (Last 60s)</th>
-                                            <th scope="col">Total (Today)</th>
-                                            <th scope="col">Test</th>
-                                       </tr>
-                                   </thead>
-                                    <tbody id="key-table-body-${safeKeyId}">${modelRowsHTML}</tbody>
-                                </table>
-                            </div>
+                        </div>
+                        <div class="card-body p-3">
+                            <table class="table table-sm table-hover mb-0">
+                                <thead>
+                                    <tr>
+                                        <th scope="col">Model</th>
+                                        <th scope="col" style="width: 35%;">TPM (Last 60s)</th>
+                                        <th scope="col" style="width: 30%;">Total</th>
+                                        <th scope="col" style="width: 10%;">Test</th>
+                                   </tr>
+                               </thead>
+                                <tbody id="key-table-body-${safeKeyId}">${modelRowsHTML}</tbody>
+                            </table>
                         </div>
                     </div>
                 `;
             }
 
-            function updateKeyCards(data) {
-                const keySections = {
-                    'priority-keys-container': data.priority_keys,
-                    'secondary-keys-container': data.secondary_keys
-                };
-
-                for (const containerId in keySections) {
-                    const container = document.getElementById(containerId);
-                    const keys = keySections[containerId];
-                    if (!container) continue;
-
-                    if (!keys || keys.length === 0) {
-                        container.innerHTML = `
-                            <div class="col">
-                                <div class="card">
-                                    <div class="card-body text-center text-muted">
-                                        No ${containerId.includes('priority') ? 'priority' : 'secondary'} keys configured.
-                                    </div>
-                                </div>
-                            </div>`;
-                    } else {
-                        let content = '';
-                        keys.forEach(key => {
-                            content += renderKeyCard(key, data);
-                        });
-                        container.innerHTML = content;
-                    }
-                }
-            }
-            
-            // Initial call and set interval
             fetchAndUpdateStatus();
-            setInterval(fetchAndUpdateStatus, 5000); // Update every 5 seconds
+            setInterval(fetchAndUpdateStatus, 5000);
         });
     </script>
 </body>

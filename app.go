@@ -290,6 +290,12 @@ func proxyHandler(km *KeyManager, target *url.URL) gin.HandlerFunc {
 				return
 			}
 
+			if resp.StatusCode == http.StatusForbidden { // 403
+				km.PermanentlyDisableKey(apiKey)
+				log.Printf("Key %s permanently disabled due to 403 Forbidden error.", apiKey[:4])
+				continue // Retry with a new key
+			}
+
 			if resp.StatusCode == http.StatusTooManyRequests {
 				km.HandleRateLimitError(modelName, apiKey)
 				log.Printf("Rate limit hit for model %s with key %s. Retrying...", modelName, apiKey[:4])
@@ -480,6 +486,12 @@ func openAIProxyHandler(km *KeyManager, target *url.URL) gin.HandlerFunc {
 					}
 				}
 				return
+			}
+
+			if resp.StatusCode == http.StatusForbidden { // 403
+				km.PermanentlyDisableKey(apiKey)
+				log.Printf("Key %s permanently disabled due to 403 Forbidden error (OpenAI Proxy).", apiKey[:4])
+				continue // Retry with a new key
 			}
 
 			if resp.StatusCode == http.StatusTooManyRequests {
@@ -720,6 +732,12 @@ func ollamaProxyHandler(km *KeyManager, target *url.URL) gin.HandlerFunc {
 					}
 				}
 				return // Success, exit loop
+			}
+
+			if resp.StatusCode == http.StatusForbidden { // 403
+				km.PermanentlyDisableKey(apiKey)
+				log.Printf("Key %s permanently disabled due to 403 Forbidden error (Ollama Proxy).", apiKey[:4])
+				continue // Retry with a new key
 			}
 
 			if resp.StatusCode == http.StatusTooManyRequests {

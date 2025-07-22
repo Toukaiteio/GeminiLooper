@@ -17,3 +17,6 @@ start_app.*
 *.exe
 *.so
 *_test.go
+.qdrant-initialized
+*.log
+storage/

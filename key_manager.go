@@ -44,6 +44,25 @@ type LanguageModelUsage struct {
 	Past60sTokenUsage []UsageData `json:"-"`
 }
 
+func (u *LanguageModelUsage) deepCopy() *LanguageModelUsage {
+	if u == nil {
+		return nil
+	}
+
+	newU := *u
+
+	if u.Past24HoursTokenUsage != nil {
+		newU.Past24HoursTokenUsage = make([]UsageData, len(u.Past24HoursTokenUsage))
+		copy(newU.Past24HoursTokenUsage, u.Past24HoursTokenUsage)
+	} else {
+		newU.Past24HoursTokenUsage = []UsageData{}
+	}
+
+	newU.Past60sTokenUsage = nil // This field is not persisted
+
+	return &newU
+}
+
 type KeyInfo struct {
 	Key          string
 	IsPriority   bool
@@ -51,14 +70,15 @@ type KeyInfo struct {
 }
 
 type KeyManager struct {
-	config    *KeyManagerConfig
-	keys      []KeyInfo
-	usage     map[string]*LanguageModelUsage // key: modelName_key
-	mutex     sync.Mutex
-	lastSaved time.Time
-	ticker    *time.Ticker
-	stopChan  chan struct{}
-	nextReset time.Time
+	config                *KeyManagerConfig
+	keys                  []KeyInfo
+	usage                 map[string]*LanguageModelUsage // key: modelName_key
+	permanentlyBannedKeys map[string]bool                // key: apiKey
+	mutex                 sync.Mutex
+	lastSaved             time.Time
+	ticker                *time.Ticker
+	stopChan              chan struct{}
+	nextReset             time.Time
 
 	// For status page
 	lastHourTokenUsage map[string][]UsageData // key: modelName, value: usage data
@@ -78,6 +98,7 @@ type StatusData struct {
 	UnavailableKeys         []string               `json:"unavailable_keys"`
 	RateLimitedKeys         []string               `json:"rate_limited_keys"`
 	QuotaExhaustedKeys      []string               `json:"quota_exhausted_keys"`
+	PermanentlyBannedKeys   []string               `json:"permanently_banned_keys"`
 	ModelOrder              []string               `json:"model_order"`
 	ModelsConfig            map[string]ModelConfig `json:"models_config"`
 	ModelChartData          ChartData              `json:"model_chart_data"`
@@ -124,6 +145,19 @@ func NewKeyManager() (*KeyManager, error) {
 		return nil, err
 	}
 
+	// Load permanently banned keys from the file, which wasn't being done before
+	permanentlyBannedKeys := make(map[string]bool)
+	fileData, err := os.ReadFile("key_usage.json")
+	if err == nil && len(fileData) > 0 {
+		type SaveData struct {
+			PermanentlyBannedKeys map[string]bool `json:"permanently_banned_keys"`
+		}
+		var savedData SaveData
+		if json.Unmarshal(fileData, &savedData) == nil && savedData.PermanentlyBannedKeys != nil {
+			permanentlyBannedKeys = savedData.PermanentlyBannedKeys
+		}
+	}
+
 	var keys []KeyInfo
 	for i, key := range config.PriorityKeys {
 		keys = append(keys, KeyInfo{Key: key, IsPriority: true, CurrentIndex: i})
@@ -142,15 +176,16 @@ func NewKeyManager() (*KeyManager, error) {
 	}
 
 	km := &KeyManager{
-		config:             config,
-		keys:               keys,
-		usage:              usage,
-		lastSaved:          time.Now(),
-		ticker:             time.NewTicker(1 * time.Minute),
-		stopChan:           make(chan struct{}),
-		nextReset:          nextReset,
-		lastHourTokenUsage: make(map[string][]UsageData),
-		lastHourKeyUsage:   make(map[string][]UsageData),
+		config:                config,
+		keys:                  keys,
+		usage:                 usage,
+		permanentlyBannedKeys: permanentlyBannedKeys, // Use loaded banned keys
+		lastSaved:             time.Now(),
+		ticker:                time.NewTicker(1 * time.Minute),
+		stopChan:              make(chan struct{}),
+		nextReset:             nextReset,
+		lastHourTokenUsage:    make(map[string][]UsageData),
+		lastHourKeyUsage:      make(map[string][]UsageData),
 	}
 
 	go km.autoSave()
@@ -311,6 +346,10 @@ func (km *KeyManager) GetKey(modelName string) (string, string, time.Duration, e
 	var probablyAvailableKeys []KeyInfo
 
 	for _, keyInfo := range km.keys {
+		if km.permanentlyBannedKeys[keyInfo.Key] {
+			continue // Skip permanently banned keys
+		}
+
 		usageKey := modelName + "_" + keyInfo.Key
 		usage, ok := km.usage[usageKey]
 		if !ok {
@@ -343,7 +382,20 @@ func (km *KeyManager) GetKey(modelName string) (string, string, time.Duration, e
 			continue
 		}
 		if usage.ProbablyExceeded {
-			probablyAvailableKeys = append(probablyAvailableKeys, keyInfo)
+			var past60sTokens int
+			for _, data := range usage.Past60sTokenUsage {
+				past60sTokens += data.CostToken
+			}
+
+			// If usage in the last 60s is less than 50% of TPM, re-enable it.
+			if past60sTokens < model.TpmLimit/2 {
+				log.Printf("Key %s for model %s was 'probably exceeded' but usage in last 60s (%d tokens) is low. Re-enabling.", keyInfo.Key[:4], modelName, past60sTokens)
+				usage.ProbablyExceeded = false
+				usage.JustHit429 = false // Reset consecutive error flag
+				availableKeys = append(availableKeys, keyInfo)
+			} else {
+				probablyAvailableKeys = append(probablyAvailableKeys, keyInfo)
+			}
 			continue
 		}
 		availableKeys = append(availableKeys, keyInfo)
@@ -400,6 +452,16 @@ func (km *KeyManager) RecordUsage(modelName, key string, tokenCount int) {
 	usage.Past24HoursTokenUsage = append(usage.Past24HoursTokenUsage, newData)
 	usage.JustHit429 = false // A successful request resets the flag
 	UpdateLanguageModelUsage(usage, now)
+}
+
+func (km *KeyManager) PermanentlyDisableKey(apiKey string) {
+	km.mutex.Lock()
+	if _, exists := km.permanentlyBannedKeys[apiKey]; !exists {
+		km.permanentlyBannedKeys[apiKey] = true
+		log.Printf("Permanently disabling key %s due to 403 Forbidden error.", apiKey[:4])
+		// The key will be persisted in the next auto-save cycle.
+	}
+	km.mutex.Unlock()
 }
 
 func (km *KeyManager) HandleRateLimitError(modelName, key string) {
@@ -528,70 +590,117 @@ func LoadKeyUsage(config *KeyManagerConfig) (map[string]*LanguageModelUsage, err
 	}
 
 	// Load existing usage data if it exists
-	usageData, err := os.ReadFile(usagePath)
+	fileData, err := os.ReadFile(usagePath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// File doesn't exist, so we'll just save the new one
-			if err := saveUsageToFile(newUsage, usagePath); err != nil {
-				return nil, err
-			}
+			// File doesn't exist, so we'll just save the new one and return it
+			saveInitialUsage(newUsage, usagePath)
 			return newUsage, nil
 		}
 		return nil, fmt.Errorf("failed to read usage file: %v", err)
 	}
 
-	if len(usageData) > 0 {
-		var oldUsage map[string]*LanguageModelUsage
-		if err := json.Unmarshal(usageData, &oldUsage); err == nil {
-			// Copy old data into the new structure
+	if len(fileData) > 0 {
+		type SaveData struct {
+			Usage                 map[string]*LanguageModelUsage `json:"usage"`
+			PermanentlyBannedKeys map[string]bool                `json:"permanently_banned_keys"`
+		}
+		var savedData SaveData
+		if err := json.Unmarshal(fileData, &savedData); err == nil {
+			// Copy old usage data into the new structure
 			for usageKey, usage := range newUsage {
-				if oldData, ok := oldUsage[usageKey]; ok {
+				if oldData, ok := savedData.Usage[usageKey]; ok {
 					usage.TotalTokenUse = oldData.TotalTokenUse
 					usage.TodayUsage = oldData.TodayUsage
-					// Make sure Past24HoursTokenUsage is not nil
 					if oldData.Past24HoursTokenUsage != nil {
 						usage.Past24HoursTokenUsage = oldData.Past24HoursTokenUsage
 					}
 					usage.ProbablyExceeded = oldData.ProbablyExceeded
 					usage.Exceeded = oldData.Exceeded
-					// JustHit429 is a runtime-only field, so no need to load it.
 				}
+			}
+			// km.permanentlyBannedKeys will be set after KeyManager is created
+			if savedData.PermanentlyBannedKeys != nil {
+				// This part is tricky, we need to load it into the key manager instance
+				// We will do this in NewKeyManager after km is created.
 			}
 		} else {
 			log.Printf("Failed to parse usage file, reinitializing: %v", err)
+			saveInitialUsage(newUsage, usagePath)
 		}
 	}
 
 	// Overwrite the old usage file with the cleaned, config-synced data
-	if err := saveUsageToFile(newUsage, usagePath); err != nil {
-		return nil, err
-	}
+	// saveInitialUsage(newUsage, usagePath) // This was the bug, it should not be called every time.
 
 	return newUsage, nil
 }
 
+// Helper to save initial usage data
+func saveInitialUsage(usage map[string]*LanguageModelUsage, path string) {
+	type SaveData struct {
+		Usage                 map[string]*LanguageModelUsage `json:"usage"`
+		PermanentlyBannedKeys map[string]bool                `json:"permanently_banned_keys"`
+	}
+	dataToSave := SaveData{
+		Usage:                 usage,
+		PermanentlyBannedKeys: make(map[string]bool), // Initially empty
+	}
+	usageData, err := json.MarshalIndent(dataToSave, "", "  ")
+	if err != nil {
+		log.Printf("Failed to marshal initial usage data: %v", err)
+		return
+	}
+	if err := os.WriteFile(path, usageData, 0644); err != nil {
+		log.Printf("Failed to write initial usage data: %v", err)
+	}
+}
+
 func (km *KeyManager) SaveUsage() {
 	km.mutex.Lock()
-	defer km.mutex.Unlock()
 
 	// Avoid saving too frequently
 	if time.Since(km.lastSaved) < 10*time.Second {
+		km.mutex.Unlock()
 		return
 	}
 
-	if err := saveUsageToFile(km.usage, "key_usage.json"); err != nil {
-		log.Printf("Error saving usage data: %v", err)
+	// Create a deep copy of the data to be saved, inside the lock
+	usageCopy := make(map[string]*LanguageModelUsage)
+	for k, v := range km.usage {
+		usageCopy[k] = v.deepCopy()
+	}
+	bannedKeysCopy := make(map[string]bool)
+	for k, v := range km.permanentlyBannedKeys {
+		bannedKeysCopy[k] = v
 	}
 	km.lastSaved = time.Now()
-	log.Println("Usage data saved.")
-}
 
-func saveUsageToFile(usage map[string]*LanguageModelUsage, path string) error {
-	usageData, err := json.MarshalIndent(usage, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal usage data: %v", err)
+	km.mutex.Unlock() // Unlock before I/O operations
+
+	// Create a combined struct to save both usage and banned keys
+	type SaveData struct {
+		Usage                 map[string]*LanguageModelUsage `json:"usage"`
+		PermanentlyBannedKeys map[string]bool                `json:"permanently_banned_keys"`
 	}
-	return os.WriteFile(path, usageData, 0644)
+
+	dataToSave := SaveData{
+		Usage:                 usageCopy,
+		PermanentlyBannedKeys: bannedKeysCopy,
+	}
+
+	usageData, err := json.MarshalIndent(dataToSave, "", "  ")
+	if err != nil {
+		log.Printf("Error marshalling save data: %v", err)
+		return
+	}
+
+	if err := os.WriteFile("key_usage.json", usageData, 0644); err != nil {
+		log.Printf("Error saving usage data: %v", err)
+		return // Return on error
+	}
+
+	log.Println("Usage data saved.")
 }
 
 func UpdateLanguageModelUsage(usage *LanguageModelUsage, now int64) {
@@ -638,6 +747,9 @@ func (km *KeyManager) GetStatus() *StatusData {
 	sort.Strings(modelOrder) // Sort model names alphabetically
 
 	for _, key := range allKeys {
+		if km.permanentlyBannedKeys[key] {
+			continue // Don't show banned keys in the main list
+		}
 		keyStatus := make(KeyStatus)
 		for _, modelName := range modelOrder {
 			usageKey := modelName + "_" + key
@@ -691,13 +803,9 @@ func (km *KeyManager) GetStatus() *StatusData {
 		for _, modelName := range modelOrder {
 			usageKey := modelName + "_" + currentRawKey
 			if usage, ok := km.usage[usageKey]; ok {
-				// This gives minute-by-minute data for the active key's models
-				// We need to aggregate it per model for the chart
-				// Let's build a temporary history for this
 				modelHistory := make(map[int64]int)
 				for _, dataPoint := range usage.Past24HoursTokenUsage {
 					if int64(dataPoint.Timestamp) >= now-3600 {
-						// Round timestamp to the nearest minute
 						minuteTimestamp := (int64(dataPoint.Timestamp) / 60) * 60
 						modelHistory[minuteTimestamp] += dataPoint.CostToken
 					}
@@ -706,7 +814,6 @@ func (km *KeyManager) GetStatus() *StatusData {
 				for ts, tokens := range modelHistory {
 					historySlice = append(historySlice, UsageData{Timestamp: int(ts), CostToken: tokens})
 				}
-				// Sort by timestamp
 				sort.Slice(historySlice, func(i, j int) bool {
 					return historySlice[i].Timestamp < historySlice[j].Timestamp
 				})
@@ -726,6 +833,7 @@ func (km *KeyManager) GetStatus() *StatusData {
 		SecondaryKeys:           km.config.SecondaryKeys,
 		RateLimitedKeys:         keysFromMap(rateLimitedKeys),
 		QuotaExhaustedKeys:      keysFromMap(quotaExhaustedKeys),
+		PermanentlyBannedKeys:   keysFromMap(km.permanentlyBannedKeys),
 		UnavailableKeys:         keysFromMap(unavailableKeys),
 		ModelOrder:              modelOrder,
 		ModelsConfig:            modelsConfig,
@@ -831,6 +939,9 @@ func (km *KeyManager) findBestKey(modelName string, now int64) (string, time.Dur
 	var probablyAvailableKeys []KeyInfo
 
 	for _, keyInfo := range km.keys {
+		if km.permanentlyBannedKeys[keyInfo.Key] {
+			continue
+		}
 		usageKey := modelName + "_" + keyInfo.Key
 		usage, ok := km.usage[usageKey]
 		if !ok {
